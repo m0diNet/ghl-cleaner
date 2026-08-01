@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+ghl-browser-profile/
+browser-profile/
+playwright-report/
+test-results/
+
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
