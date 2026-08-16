@@ -1,1176 +1,333 @@
-require("dotenv").config();
-
-const express = require("express");
-const axios = require("axios");
-const path = require("path");
-const { spawn } = require("child_process");
-
+require('dotenv').config();
+const crypto = require('crypto');
+const express = require('express');
+const axios = require('axios');
+const path = require('path');
+const { spawn } = require('child_process');
+const { deleteSelectedApiItems } = require('./services/ghlApi');
+const { scanVerifiedResources } = require('./services/verifiedScanner');
 const {
-  scanApiResources,
-  deleteSelectedApiItems,
-} = require("./services/ghlApi");
+  formatBrowserlessError,
+  testBrowserlessGhlAuthStatus,
+  testBrowserlessHealth,
+} = require('../services/browserless');
 
 const app = express();
+const PORT = Number(process.env.WEB_PORT || 3000);
+const ROOT = path.resolve(__dirname, '..');
+const snapshots = new Map();
+const SNAPSHOT_TTL = 30 * 60 * 1000;
 
-const PORT = Number(
-  process.env.WEB_PORT || 3000
-);
+app.use(express.json({ limit: '5mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const PROJECT_ROOT = path.resolve(
-  __dirname,
-  ".."
-);
+const clean = (value) => String(value || '').replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').replace(/\r/g, '');
+const errorMessage = (error) => error.response?.data?.message || error.response?.data?.error || error.message || 'Unknown error';
 
-app.use(
-  express.json({
-    limit: "2mb",
-  })
-);
-
-app.use(
-  express.static(
-    path.join(
-      __dirname,
-      "public"
-    )
-  )
-);
-
-
-// =====================================================
-// GENERAL HELPERS
-// =====================================================
-
-function cleanTerminalText(value) {
-  return String(value || "")
-    .replace(
-      /\x1B\[[0-9;]*[A-Za-z]/g,
-      ""
-    )
-    .replace(/\r/g, "");
-}
-
-
-function getErrorMessage(error) {
-  return (
-    error.response?.data?.message ||
-    error.response?.data?.error ||
-    error.message ||
-    "Unknown error"
-  );
-}
-
-
-function validateCredentials(req, res) {
-  const locationId = String(
-    req.body.locationId || ""
-  ).trim();
-
-  const token = String(
-    req.body.token || ""
-  ).trim();
-
+function credentials(req, res) {
+  const locationId = String(req.body.locationId || '').trim();
+  const token = String(req.body.token || '').trim();
   if (!locationId || !token) {
-    res.status(400).json({
-      success: false,
-
-      message:
-        "Location ID and Integration Token are required.",
-    });
-
+    res.status(400).json({ success: false, message: 'Location ID and Integration Token are required.' });
     return null;
   }
-
-  return {
-    locationId,
-    token,
-  };
+  return { locationId, token };
 }
 
-
-function runNodeScript(
-  scriptName,
-  credentials,
-  extraEnv = {}
-) {
-  return new Promise(
-    (resolve, reject) => {
-      const scriptPath = path.join(
-        PROJECT_ROOT,
-        scriptName
-      );
-
-      const child = spawn(
-        process.execPath,
-        [scriptPath],
-        {
-          cwd: PROJECT_ROOT,
-
-          env: {
-            ...process.env,
-
-            GHL_LOCATION_ID:
-              credentials.locationId,
-
-            GHL_TOKEN:
-              credentials.token,
-
-            DRY_RUN: "true",
-
-            BROWSER_DELETE:
-              "false",
-
-            ...extraEnv,
-          },
-
-          windowsHide: true,
-        }
-      );
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout.on(
-        "data",
-        (data) => {
-          stdout += data.toString();
-        }
-      );
-
-      child.stderr.on(
-        "data",
-        (data) => {
-          stderr += data.toString();
-        }
-      );
-
-      child.on(
-        "error",
-        reject
-      );
-
-      child.on(
-        "close",
-        (code) => {
-          const cleanOutput =
-            cleanTerminalText(stdout);
-
-          const cleanErrors =
-            cleanTerminalText(stderr);
-
-          if (
-            code !== 0 &&
-            !cleanOutput
-          ) {
-            reject(
-              new Error(
-                cleanErrors ||
-                `${scriptName} exited with code ${code}`
-              )
-            );
-
-            return;
-          }
-
-          resolve({
-            code,
-            stdout: cleanOutput,
-            stderr: cleanErrors,
-          });
-        }
-      );
-    }
-  );
+function runScript(scriptName, values, extraEnv = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(ROOT, scriptName)], {
+      cwd: ROOT,
+      env: { ...process.env, GHL_LOCATION_ID: values.locationId, GHL_TOKEN: values.token, ...extraEnv },
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (data) => { stdout += data; process.stdout.write(data); });
+    child.stderr.on('data', (data) => { stderr += data; process.stderr.write(data); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(clean(stderr) || clean(stdout) || `${scriptName} exited with ${code}`));
+      resolve({ stdout: clean(stdout), stderr: clean(stderr) });
+    });
+  });
 }
 
-
-// =====================================================
-// RESOURCE DEFINITIONS
-// =====================================================
-
-function normalizeKey(label) {
-  const map = {
-    Location:
-      "location",
-
-    Tags:
-      "tags",
-
-    "Custom Fields":
-      "customFields",
-
-    Contacts:
-      "contacts",
-
-    Opportunities:
-      "opportunities",
-
-    Calendars:
-      "calendars",
-
-    Workflows:
-      "workflows",
-
-    Funnels:
-      "funnels",
-
-    Pipelines:
-      "pipelines",
-
-    Forms:
-      "forms",
-
-    Surveys:
-      "surveys",
-
-    "URL Redirects":
-      "urlRedirects",
-
-    Products:
-      "products",
-
-    "Custom Values":
-      "customValues",
-
-    "Email/SMS Templates":
-      "templates",
-
-    "Trigger Links":
-      "triggerLinks",
-  };
-
-  return map[label] || null;
+function parseMarker(output, marker) {
+  const line = output.split('\n').find((candidate) => candidate.startsWith(marker));
+  if (!line) return { results: [], deleted: 0, failed: 1, skipped: 0 };
+  try { return JSON.parse(line.slice(marker.length)); }
+  catch { return { results: [], deleted: 0, failed: 1, skipped: 0 }; }
 }
 
-
-function createResource(label) {
-  return {
-    label,
-    count: 0,
-    items: [],
-    status: "unknown",
-    error: null,
-  };
-}
-
-
-function createEmptyResources() {
-  return {
-    tags:
-      createResource("Tags"),
-
-    customFields:
-      createResource(
-        "Custom Fields"
-      ),
-
-    customValues:
-      createResource(
-        "Custom Values"
-      ),
-
-    calendars:
-      createResource(
-        "Calendars"
-      ),
-
-    workflows:
-      createResource(
-        "Workflows"
-      ),
-
-    funnels:
-      createResource(
-        "Funnels"
-      ),
-
-    forms:
-      createResource(
-        "Forms"
-      ),
-
-    triggerLinks:
-      createResource(
-        "Trigger Links"
-      ),
-
-    contacts:
-      createResource(
-        "Contacts"
-      ),
-
-    opportunities:
-      createResource(
-        "Opportunities"
-      ),
-
-    pipelines:
-      createResource(
-        "Pipelines"
-      ),
-
-    surveys:
-      createResource(
-        "Surveys"
-      ),
-
-    products:
-      createResource(
-        "Products"
-      ),
-
-    templates:
-      createResource(
-        "Email/SMS Templates"
-      ),
-
-    urlRedirects:
-      createResource(
-        "URL Redirects"
-      ),
-  };
-}
-
-
-function makeDisplayItemId(
-  category,
-  position,
-  name
-) {
-  const safeName = String(
-    name || ""
-  )
-    .toLowerCase()
-    .replace(
-      /[^a-z0-9]+/g,
-      "-"
-    )
-    .replace(
-      /^-+|-+$/g,
-      ""
-    )
-    .slice(0, 80);
-
-  return `${category}-${position}-${safeName || "item"}`;
-}
-
-
-// =====================================================
-// AUDIT OUTPUT PARSER
-// =====================================================
-
-function parseAuditOutput(output) {
-  const resources =
-    createEmptyResources();
-
-  const lines =
-    cleanTerminalText(output)
-      .split("\n");
-
-  let locationName =
-    "Connected GHL Account";
-
-  let activeKey = null;
-  let readingList = false;
-  let pendingItem = null;
-
-
-  function savePendingItem() {
-    if (
-      !pendingItem ||
-      !activeKey ||
-      !resources[activeKey]
-    ) {
-      pendingItem = null;
-      return;
-    }
-
-    const name =
-      pendingItem.name
-        .replace(
-          /\s+/g,
-          " "
-        )
-        .trim();
-
-    if (name) {
-      resources[
-        activeKey
-      ].items.push({
-        id:
-          makeDisplayItemId(
-            activeKey,
-            pendingItem.position,
-            name
-          ),
-
-        position:
-          pendingItem.position,
-
-        name,
-
-        type:
-          activeKey,
-
-        realId:
-          false,
-      });
-    }
-
-    pendingItem = null;
-  }
-
-
-  for (
-    const rawLine of lines
-  ) {
-    const line =
-      rawLine.trim();
-
-    const successMatch =
-      line.match(
-        /^✅ (.+?): SUCCESS$/
-      );
-
-    const failedMatch =
-      line.match(
-        /^❌ (.+?): FAILED$/
-      );
-
-
-    if (
-      successMatch ||
-      failedMatch
-    ) {
-      savePendingItem();
-
-      const label =
-        successMatch
-          ? successMatch[1]
-          : failedMatch[1];
-
-      activeKey =
-        normalizeKey(label);
-
-      readingList =
-        false;
-
-      if (
-        activeKey &&
-        resources[activeKey]
-      ) {
-        resources[
-          activeKey
-        ].status =
-          successMatch
-            ? "success"
-            : "failed";
-      }
-
-      continue;
-    }
-
-
-    if (
-      activeKey ===
-      "location"
-    ) {
-      const nameMatch =
-        line.match(
-          /^Name:\s*(.+)$/
-        );
-
-      if (nameMatch) {
-        locationName =
-          nameMatch[1].trim();
-      }
-
-      continue;
-    }
-
-
-    if (
-      !activeKey ||
-      !resources[activeKey]
-    ) {
-      continue;
-    }
-
-
-    const countMatch =
-      line.match(
-        /^Found(?: on first page)?:\s*(\d+)/
-      );
-
-    if (countMatch) {
-      resources[
-        activeKey
-      ].count =
-        Number(
-          countMatch[1]
-        );
-
-      continue;
-    }
-
-
-    if (
-      /^[A-Z][A-Z /-]+ LIST:$/.test(
-        line
-      )
-    ) {
-      savePendingItem();
-
-      readingList = true;
-
-      continue;
-    }
-
-
-    if (
-      line ===
-        "AUDIT FINISHED" ||
-      line ===
-        "NOTHING WAS DELETED" ||
-      /^={5,}$/.test(line)
-    ) {
-      savePendingItem();
-
-      readingList = false;
-
-      continue;
-    }
-
-
-    if (!readingList) {
-      continue;
-    }
-
-
-    const itemMatch =
-      line.match(
-        /^(\d+)\.\s+(.+)$/
-      );
-
-    if (itemMatch) {
-      savePendingItem();
-
-      pendingItem = {
-        position:
-          Number(
-            itemMatch[1]
-          ),
-
-        name:
-          itemMatch[2].trim(),
-      };
-
-      continue;
-    }
-
-
-    if (
-      pendingItem &&
-      line &&
-      !line.startsWith("✅") &&
-      !line.startsWith("❌") &&
-      !line.startsWith("⚠️")
-    ) {
-      pendingItem.name +=
-        ` ${line}`;
-    }
-  }
-
-
-  savePendingItem();
-
-
-  for (
-    const [
-      category,
-      resource,
-    ] of Object.entries(
-      resources
-    )
-  ) {
-    const seen =
-      new Set();
-
-    resource.items =
-      resource.items.filter(
-        (item) => {
-          const key =
-            `${item.position}:${item.name}`;
-
-          if (
-            seen.has(key)
-          ) {
-            return false;
-          }
-
-          seen.add(key);
-
-          return true;
-        }
-      );
-
-    resource.items =
-      resource.items.map(
-        (
-          item,
-          index
-        ) => ({
-          ...item,
-
-          position:
-            item.position ||
-            index + 1,
-
-          id:
-            item.id ||
-            makeDisplayItemId(
-              category,
-              index + 1,
-              item.name
-            ),
-        })
-      );
-
-    if (
-      resource.items.length >
-      resource.count
-    ) {
-      resource.count =
-        resource.items.length;
-    }
-  }
-
-
-  return {
-    locationName,
-    resources,
-  };
-}
-
-
-// =====================================================
-// TEST CONNECTION
-// =====================================================
-
-app.post(
-  "/api/test-connection",
-  async (req, res) => {
-    const credentials =
-      validateCredentials(
-        req,
-        res
-      );
-
-    if (!credentials) {
-      return;
-    }
-
-    try {
-      const response =
-        await axios.get(
-          `https://services.leadconnectorhq.com/locations/${credentials.locationId}`,
-          {
-            headers: {
-              Authorization:
-                `Bearer ${credentials.token}`,
-
-              Version:
-                "2021-07-28",
-
-              Accept:
-                "application/json",
-            },
-
-            timeout:
-              30000,
-          }
-        );
-
-      const location =
-        response.data.location ||
-        response.data;
-
-      res.json({
-        success: true,
-
-        location: {
-          id:
-            location.id ||
-            credentials.locationId,
-
-          name:
-            location.name ||
-            location.business?.name ||
-            "Connected GHL Account",
-        },
-      });
-    } catch (error) {
-      res
-        .status(
-          error.response?.status ||
-          500
-        )
-        .json({
-          success: false,
-
-          message:
-            "Connection failed.",
-
-          details:
-            getErrorMessage(
-              error
-            ),
-        });
-    }
-  }
-);
-
-
-// =====================================================
-// SCAN ACCOUNT
-// =====================================================
-
-app.post(
-  "/api/scan",
-  async (req, res) => {
-    const credentials =
-      validateCredentials(
-        req,
-        res
-      );
-
-    if (!credentials) {
-      return;
-    }
-
-    try {
-      console.log("");
-      console.log(
-        "=============================="
-      );
-
-      console.log(
-        `Scanning location: ${credentials.locationId}`
-      );
-
-      console.log(
-        "=============================="
-      );
-
-
-      const auditResult =
-        await runNodeScript(
-          "audit.js",
-          credentials,
-          {
-            DRY_RUN:
-              "true",
-
-            BROWSER_DELETE:
-              "false",
-          }
-        );
-
-
-      const parsed =
-        parseAuditOutput(
-          auditResult.stdout
-        );
-
-
-      /*
-        Tags, Custom Fields and Custom Values
-        need their real GHL IDs before selected
-        deletion can be safely enabled.
-      */
-
-      const apiResources =
-        await scanApiResources(
-          credentials
-        );
-
-
-      for (
-        const category of [
-          "tags",
-          "customFields",
-          "customValues",
-        ]
-      ) {
-        const apiResult =
-          apiResources[
-            category
-          ];
-
-        if (!apiResult) {
-          continue;
-        }
-
-        parsed.resources[
-          category
-        ].status =
-          apiResult.status;
-
-        parsed.resources[
-          category
-        ].error =
-          apiResult.error ||
-          null;
-
-
-        if (
-          apiResult.status ===
-          "success"
-        ) {
-          parsed.resources[
-            category
-          ].items =
-            apiResult.items.map(
-              (
-                item,
-                index
-              ) => ({
-                ...item,
-
-                position:
-                  index + 1,
-
-                type:
-                  category,
-
-                realId:
-                  true,
-              })
-            );
-
-          parsed.resources[
-            category
-          ].count =
-            apiResult.items.length;
-        }
-      }
-
-
-      const totalItems =
-        Object.values(
-          parsed.resources
-        ).reduce(
-          (
-            total,
-            resource
-          ) =>
-            total +
-            resource.items.length,
-
-          0
-        );
-
-
-      console.log(
-        `Scan finished: ${parsed.locationName}`
-      );
-
-      console.log(
-        `Individual items loaded: ${totalItems}`
-      );
-
-
-      res.json({
-        success: true,
-
-        location: {
-          id:
-            credentials.locationId,
-
-          name:
-            parsed.locationName,
-        },
-
-        resources:
-          parsed.resources,
-
-        deletableCategories: [
-          "tags",
-          "customFields",
-          "customValues",
-        ],
-
-        summary: {
-          categories:
-            Object.keys(
-              parsed.resources
-            ).length,
-
-          individualItems:
-            totalItems,
-        },
-      });
-    } catch (error) {
-      console.error(
-        "Scan error:",
-        error
-      );
-
-      res
-        .status(500)
-        .json({
-          success: false,
-
-          message:
-            "Account scan failed.",
-
-          details:
-            getErrorMessage(
-              error
-            ),
-        });
-    }
-  }
-);
-
-
-// =====================================================
-// DELETE ONLY SELECTED ITEMS
-// =====================================================
-
-app.post(
-  "/api/delete-selected",
-  async (req, res) => {
-    const credentials =
-      validateCredentials(
-        req,
-        res
-      );
-
-    if (!credentials) {
-      return;
-    }
-
-
-    const confirmation =
-      String(
-        req.body.confirmation ||
-        ""
-      ).trim();
-
-
-    if (
-      confirmation !==
-      "DELETE"
-    ) {
-      res
-        .status(400)
-        .json({
-          success: false,
-
-          message:
-            'Type exactly "DELETE" to confirm.',
-        });
-
-      return;
-    }
-
-
-    const requestedSelections =
-      req.body.selections ||
-      {};
-
-
-    const supportedCategories = [
-      "tags",
-      "customFields",
-      "customValues",
-    ];
-
-
-    const selections = {};
-
-    let totalSelected = 0;
-
-
-    for (
-      const category of
-      supportedCategories
-    ) {
-      const items =
-        Array.isArray(
-          requestedSelections[
-            category
-          ]
-        )
-          ? requestedSelections[
-              category
-            ]
+function parseCustomValueItems(input) {
+  const source = Array.isArray(input)
+    ? input
+    : Array.isArray(input?.items)
+      ? input.items
+      : Array.isArray(input?.values)
+        ? input.values
+        : Array.isArray(input?.customValues)
+          ? input.customValues
           : [];
 
+  return source
+    .map((item) => ({
+      name: String(item?.name || item?.key || "").trim(),
+      value: String(item?.value || "").trim(),
+    }))
+    .filter((item) => item.name && item.value);
+}
 
-      selections[
-        category
-      ] =
-        items
-          .map(
-            (item) => ({
-              id:
-                String(
-                  item.id ||
-                  ""
-                ).trim(),
+function labels(resources) {
+  const names = { tags: 'Tags', customFields: 'Custom Fields', customValues: 'Custom Values', workflows: 'Workflows', funnels: 'Funnels', forms: 'Forms', triggerLinks: 'Trigger Links' };
+  return Object.fromEntries(Object.entries(resources).map(([category, resource]) => [category, { ...resource, label: names[category] || category }]));
+}
 
-              name:
-                String(
-                  item.name ||
-                  "Unnamed item"
-                ).trim(),
-            })
-          )
-          .filter(
-            (item) =>
-              item.id
-          );
+function saveSnapshot(locationId, resources) {
+  const scanId = crypto.randomUUID();
+  snapshots.set(scanId, { locationId, resources, createdAt: Date.now() });
+  for (const [id, snapshot] of snapshots) if (Date.now() - snapshot.createdAt > SNAPSHOT_TTL) snapshots.delete(id);
+  return scanId;
+}
 
+function getSnapshot(scanId, locationId) {
+  const snapshot = snapshots.get(String(scanId || ''));
+  if (!snapshot || snapshot.locationId !== locationId || Date.now() - snapshot.createdAt > SNAPSHOT_TTL) return null;
+  return snapshot;
+}
 
-      totalSelected +=
-        selections[
-          category
-        ].length;
+function sanitizeAgainstSnapshot(snapshot, requested) {
+  const output = {};
+  for (const category of ['tags', 'customFields', 'customValues', 'triggerLinks', 'workflows', 'funnels', 'forms']) {
+    const resource = snapshot.resources[category];
+    if (!resource?.verified) {
+      output[category] = [];
+      continue;
     }
-
-
-    if (
-      !totalSelected
-    ) {
-      res
-        .status(400)
-        .json({
-          success: false,
-
-          message:
-            "No supported items were selected. Select Tags, Custom Fields, or Custom Values.",
-        });
-
-      return;
-    }
-
-
-    try {
-      console.log("");
-      console.log(
-        "=============================="
-      );
-
-      console.log(
-        `Deleting ${totalSelected} selected items`
-      );
-
-      console.log(
-        `Location: ${credentials.locationId}`
-      );
-
-      console.log(
-        "=============================="
-      );
-
-
-      const result =
-        await deleteSelectedApiItems({
-          ...credentials,
-          selections,
-        });
-
-
-      res.json({
-        success:
-          result.failed === 0,
-
-        message:
-          result.failed === 0
-            ? "Selected items deleted successfully."
-            : "Cleanup finished with some failures.",
-
-        deleted:
-          result.deleted,
-
-        failed:
-          result.failed,
-
-        results:
-          result.results,
-      });
-    } catch (error) {
-      console.error(
-        "Deletion error:",
-        error
-      );
-
-      res
-        .status(500)
-        .json({
-          success: false,
-
-          message:
-            "Selected deletion failed.",
-
-          details:
-            getErrorMessage(
-              error
-            ),
-        });
-    }
+    const allowed = new Map(resource.items.map((item) => [String(item.id), item]));
+    output[category] = (Array.isArray(requested?.[category]) ? requested[category] : [])
+      .map((item) => allowed.get(String(item.id || '')))
+      .filter(Boolean)
+      .map((item) => ({ id: item.id, name: item.name, type: category }));
   }
-);
+  return output;
+}
 
+async function browser(category, values, mode, targets) {
+  const result = await runScript(`browser-${category}.js`, values, {
+    BROWSER_MODE: mode,
+    BROWSER_TARGETS: JSON.stringify(targets || []),
+    BROWSER_AUTO_CLOSE: 'true',
+  });
+  return parseMarker(result.stdout, 'BROWSER_RESULT_JSON:');
+}
 
-// =====================================================
-// HEALTH CHECK
-// =====================================================
+app.post('/api/test-connection', async (req, res) => {
+  const values = credentials(req, res); if (!values) return;
+  try {
+    const response = await axios.get(`https://services.leadconnectorhq.com/locations/${values.locationId}`, {
+      headers: { Authorization: `Bearer ${values.token}`, Version: '2021-07-28', Accept: 'application/json' },
+      timeout: 30000,
+    });
+    const location = response.data.location || response.data;
+    res.json({ success: true, location: { id: location.id || values.locationId, name: location.name || location.business?.name || 'Connected GHL Account' } });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ success: false, message: 'Connection failed.', details: errorMessage(error) });
+  }
+});
 
-app.get(
-  "/api/health",
-  (req, res) => {
+app.post('/api/scan', async (req, res) => {
+  const values = credentials(req, res); if (!values) return;
+  try {
+    const resources = labels(await scanVerifiedResources(values));
+    const scanId = saveSnapshot(values.locationId, resources);
+    const allVerified = Object.values(resources).every((resource) => resource.verified);
     res.json({
       success: true,
-      status: "running",
-      port: PORT,
+      scanId,
+      location: { id: values.locationId, name: req.body.locationName || 'Connected GHL Account' },
+      resources,
+      allVerified,
+      deletableCategories: Object.entries(resources).filter(([, resource]) => resource.verified).map(([category]) => category),
+      browserCategories: ['workflows', 'funnels', 'forms'],
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Verified account scan failed.', details: errorMessage(error) });
+  }
+});
+
+app.post('/api/delete-selected', async (req, res) => {
+  const values = credentials(req, res); if (!values) return;
+  const snapshot = getSnapshot(req.body.scanId, values.locationId);
+  if (!snapshot) return res.status(409).json({ success: false, message: 'The verified scan expired. Scan the account again.' });
+  const selections = sanitizeAgainstSnapshot(snapshot, req.body.selections);
+  const requestedCategories = Object.entries(req.body.selections || {}).filter(([, list]) => Array.isArray(list) && list.length).map(([category]) => category);
+  const unverified = requestedCategories.filter((category) => !snapshot.resources[category]?.verified);
+  if (unverified.length) return res.status(409).json({ success: false, message: `Deletion blocked. Incomplete scan: ${unverified.join(', ')}.` });
+  const total = Object.values(selections).reduce((sum, list) => sum + list.length, 0);
+  if (!total) return res.status(400).json({ success: false, message: 'Select at least one verified item.' });
+  try {
+    const apiResult = await deleteSelectedApiItems({ ...values, selections });
+    const jobs = [['workflows', selections.workflows], ['funnels', selections.funnels], ['forms', selections.forms]].filter(([, list]) => list.length);
+    const browserResults = [];
+    for (const [category, list] of jobs) {
+      browserResults.push(
+        await browser(category, values, list.length >= 10 ? 'selected-large' : 'selected', list)
+      );
+    }
+    res.json({
+      success: true,
+      deleted: apiResult.deleted + browserResults.reduce((sum, result) => sum + Number(result.deleted || 0), 0),
+      failed: apiResult.failed + browserResults.reduce((sum, result) => sum + Number(result.failed || 0), 0),
+      skipped: browserResults.reduce((sum, result) => sum + Number(result.skipped || 0), 0),
+      results: [...apiResult.results, ...browserResults.flatMap((result) => result.results || [])],
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Selected deletion failed.', details: errorMessage(error) });
+  }
+});
+
+app.post('/api/delete-category', async (req, res) => {
+  const values = credentials(req, res); if (!values) return;
+  const snapshot = getSnapshot(req.body.scanId, values.locationId);
+  if (!snapshot) return res.status(409).json({ success: false, message: 'The verified scan expired. Scan the account again.' });
+  const category = String(req.body.category || '').trim();
+  if (!snapshot.resources[category]?.verified) return res.status(409).json({ success: false, message: `Deletion blocked. ${category} scan is incomplete.` });
+  const selections = sanitizeAgainstSnapshot(snapshot, { [category]: req.body.selections?.[category] || [] });
+  const items = selections[category] || [];
+  if (!items.length) return res.status(400).json({ success: false, message: 'Select at least one verified item.' });
+  try {
+    if (['tags', 'customFields', 'customValues', 'triggerLinks'].includes(category)) {
+      const apiSelections = { tags: [], customFields: [], customValues: [], triggerLinks: [] };
+      apiSelections[category] = items;
+      const result = await deleteSelectedApiItems({ ...values, selections: apiSelections });
+      return res.json({ success: true, deleted: result.deleted, failed: result.failed, skipped: 0, results: result.results });
+    }
+    if (!['workflows', 'funnels', 'forms'].includes(category)) return res.status(400).json({ success: false, message: 'This category is not connected to deletion.' });
+    const result = await browser(category, values, items.length >= 10 ? 'selected-large' : 'selected', items);
+    return res.json({ success: true, deleted: result.deleted || 0, failed: result.failed || 0, skipped: result.skipped || 0, results: result.results || [] });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: `Failed to delete ${category}.`, details: errorMessage(error) });
+  }
+});
+
+app.post('/api/delete-all', async (req, res) => {
+  const values = credentials(req, res); if (!values) return;
+  if (String(req.body.confirmation || '').trim() !== 'DELETE EVERYTHING') {
+    return res.status(400).json({ success: false, message: 'Type exactly "DELETE EVERYTHING".' });
+  }
+
+  const categories = Array.isArray(req.body.categories) ? req.body.categories : [];
+  const apiCategories = ['tags', 'customFields', 'customValues', 'triggerLinks'];
+  const browserCategories = ['workflows', 'funnels', 'forms'];
+
+  try {
+    const fresh = labels(await scanVerifiedResources(values));
+
+    const requestedApiCategories = apiCategories.filter((category) => categories.includes(category));
+    const incompleteApiCategories = requestedApiCategories.filter(
+      (category) => !fresh[category]?.verified
+    );
+
+    if (incompleteApiCategories.length) {
+      return res.status(409).json({
+        success: false,
+        message: `Delete Everything blocked for incomplete API categories: ${incompleteApiCategories.join(', ')}.`,
+      });
+    }
+
+    const apiSelections = {
+      tags: categories.includes('tags') ? fresh.tags.items : [],
+      customFields: categories.includes('customFields') ? fresh.customFields.items : [],
+      customValues: categories.includes('customValues') ? fresh.customValues.items : [],
+      triggerLinks: categories.includes('triggerLinks') ? fresh.triggerLinks.items : [],
+    };
+
+    const apiResult = await deleteSelectedApiItems({ ...values, selections: apiSelections });
+
+    const browserResults = [];
+    for (const category of browserCategories) {
+      if (!categories.includes(category)) continue;
+      browserResults.push(await browser(category, values, 'all', []));
+    }
+
+    res.json({
+      success: true,
+      deleted: apiResult.deleted + browserResults.reduce((sum, result) => sum + Number(result.deleted || 0), 0),
+      failed: apiResult.failed + browserResults.reduce((sum, result) => sum + Number(result.failed || 0), 0),
+      skipped: browserResults.reduce((sum, result) => sum + Number(result.skipped || 0), 0),
+      results: [...apiResult.results, ...browserResults.flatMap((result) => result.results || [])],
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Delete Everything failed.', details: errorMessage(error) });
+  }
+});
+
+async function runCustomValuesSeed(req, res) {
+  const values = credentials(req, res);
+  if (!values) return;
+
+  const folderName = String(req.body.folderName || req.body.folder || '').trim();
+  const items = parseCustomValueItems(req.body.values || req.body.customValues || req.body.items);
+
+  if (!folderName && !items.length) {
+    return res.status(400).json({
+      success: false,
+      message: 'Provide a folderName, at least one custom value, or both.',
     });
   }
-);
 
-
-// =====================================================
-// START SERVER
-// =====================================================
-
-app.listen(
-  PORT,
-  () => {
-    console.log("");
-    console.log(
-      "=============================="
+  try {
+    const result = parseMarker(
+      (
+        await runScript('scripts/ensure-custom-values.js', values, {
+          CUSTOM_VALUE_FOLDER_NAME: folderName,
+          CUSTOM_VALUES: JSON.stringify(items),
+        })
+      ).stdout,
+      'CUSTOM_VALUES_RESULT_JSON:'
     );
 
-    console.log(
-      "GHL CLEANUP WEB ENGINE"
-    );
-
-    console.log(
-      "=============================="
-    );
-
-    console.log(
-      `Open: http://localhost:${PORT}`
-    );
-
-    console.log(
-      "Mode: selected deletion enabled"
-    );
-
-    console.log(
-      "=============================="
-    );
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Custom values seeding failed.',
+      details: errorMessage(error),
+    });
   }
-);
+}
+
+app.post('/api/custom-values/ensure', runCustomValuesSeed);
+app.post('/api/custom-values/seed', runCustomValuesSeed);
+
+app.get('/api/health', (_req, res) => res.json({ success: true, status: 'running' }));
+
+app.get('/api/browserless-health', async (_req, res) => {
+  try {
+    await testBrowserlessHealth();
+    res.json({ success: true, connected: true });
+  } catch (error) {
+    res.status(503).json({
+      success: false,
+      connected: false,
+      message: 'Browserless health check failed.',
+      details: formatBrowserlessError(error),
+    });
+  }
+});
+
+app.get('/api/browserless-ghl-auth-status', async (_req, res) => {
+  const result = await testBrowserlessGhlAuthStatus({
+    locationId: process.env.GHL_LOCATION_ID,
+  });
+
+  if (!result.browserless) {
+    return res.status(503).json(result);
+  }
+
+  return res.json(result);
+});
+
+app.listen(PORT, () => console.log(`\nGHL Cleanup Service\nOpen: http://localhost:${PORT}\nBrowser automation: Browserless remote\nVerified API scan required before deletion\n`));

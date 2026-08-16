@@ -5,10 +5,18 @@ node_modules/
 
 ghl-browser-profile/
 browser-profile/
+browser-state/
 playwright-report/
 test-results/
 
 *.log
+*.storage-state.json
 npm-debug.log*
 .DS_Store
 Thumbs.db
+
+browser-profiles/
+browser-local/debug/
+debug/
+web/server.js.before-playwright-v4
+web/server-browser-patch.txt

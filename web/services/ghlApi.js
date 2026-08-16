@@ -62,6 +62,7 @@ async function scanApiResources({
     tags: [],
     customFields: [],
     customValues: [],
+    triggerLinks: [],
   };
 
   const results =
@@ -82,6 +83,8 @@ async function scanApiResources({
       client.get(
         `/locations/${locationId}/customValues`
       ),
+
+      client.get(`/links/`, { params: { locationId } }),
     ]);
 
   if (results[0].status === "fulfilled") {
@@ -132,6 +135,16 @@ async function scanApiResources({
         .filter((item) => item.id);
   }
 
+  if (results[3].status === "fulfilled") {
+    resources.triggerLinks = extractArray(results[3].value.data, ["links", "triggerLinks", "data"])
+      .map((item) => ({
+        id: item.id || item._id || item.linkId,
+        name: item.name || item.title || "Unnamed trigger link",
+        type: "triggerLinks",
+      }))
+      .filter((item) => item.id);
+  }
+
   return resources;
 }
 
@@ -155,6 +168,9 @@ function getDeletePath(
 
     customValues:
       `/locations/${safeLocationId}/customValues/${safeItemId}`,
+
+    triggerLinks:
+      `/links/${safeItemId}`,
   };
 
   return paths[category] || null;
@@ -172,6 +188,7 @@ async function deleteSelectedApiItems({
     "tags",
     "customFields",
     "customValues",
+    "triggerLinks",
   ];
 
   const results = [];

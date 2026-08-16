@@ -1,10 +1,11 @@
 {
-  "name": "ghl-cleaner",
-  "version": "1.0.0",
-  "description": "",
+  "name": "clearops-ghl-cleanup-service",
+  "version": "3.0.0",
+  "description": "Local GHL resource cleanup service",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node web/server.js",
+    "check": "node --check web/server.js && node --check web/public/app.js && node --check web/services/ghlApi.js && node --check browser-cleanup.js && node --check scripts/ensure-custom-values.js"
   },
   "keywords": [],
   "author": "",
