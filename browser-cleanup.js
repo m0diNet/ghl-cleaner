@@ -291,7 +291,7 @@ async function deleteOneFromCurrentPage(scope, page, category, targetName) {
 }
 
 async function deleteNamedTargets(scope, page, category, targetItems) {
-  const pending = targetItems.map((item) => cleanText(item.name)).filter(Boolean);
+  const pending = targetItems.map((item) => cleanText(item.resourceName || item.name)).filter(Boolean);
   const failedOnce = new Set();
 
   while (pending.length) {

@@ -10,6 +10,7 @@ playwright-report/
 test-results/
 
 *.log
+debug.log
 *.storage-state.json
 npm-debug.log*
 .DS_Store
@@ -20,3 +21,5 @@ browser-local/debug/
 debug/
 web/server.js.before-playwright-v4
 web/server-browser-patch.txt
+*.tmp.csv
+*.tmp.xlsx

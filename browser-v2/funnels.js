@@ -14,23 +14,35 @@ const {
   rowLooksLikeFolder,
 } = require("../services/browser-inventory-shared");
 const { formatBrowserlessError } = require("../services/browserless");
-const { closeV2BrowserlessSession, connectV2Browserless } = require("./common");
+const { closeBrowserlessSession: closeV2BrowserlessSession, connectBrowserless: connectV2Browserless } = require("../services/browserless");
+const {
+  normalizeDeleteJob,
+  normalizeDeleteJobs,
+  toText,
+} = require("../web/services/deleteJob");
 
-const LOCATION_ID = "J7y3jQR55TZrKEOB1yQ2";
-const GHL_URL = `https://app.olspsystem.com/v2/location/${LOCATION_ID}/funnels-websites/funnels`;
 const BACKEND_URL = "https://backend.leadconnectorhq.com";
 const LOG_PATH = path.join(__dirname, "..", "debug", "v2-funnels-progress.log");
 const NAVIGATION_WAIT_MS = 30000;
 const UI_POLL_MS = 350;
-const DEFAULT_FOLDER_NAME = "..00.00 | Live Training - Dec25";
-const DEFAULT_FUNNEL_NAME = "Live Training | 00 | All Lives - Registration (Comms Gen) - Dec25";
 const startedAt = Date.now();
 const VERIFICATION_ONLY = /^(1|true|yes|verify)$/i.test(
   String(process.env.FUNNEL_VERIFY_ONLY || process.env.FUNNEL_MODE || "").trim()
 ) || process.argv.includes("--verify-only");
 const WATCHDOG_MS = VERIFICATION_ONLY ? 90000 : 58000;
 
-const TARGET_OVERRIDE = parseTargetOverride();
+const DELETE_JOBS_STATE = parseDeleteJobsJson();
+const TARGET_SELECTION = selectSingleFunnelJob(DELETE_JOBS_STATE.jobs);
+const TARGET_OVERRIDE = TARGET_SELECTION.job;
+const LOCATION_ID = String(TARGET_OVERRIDE?.locationId || "").trim();
+const GHL_URL = `https://app.olspsystem.com/v2/location/${LOCATION_ID}/funnels-websites/funnels`;
+const AUTHENTICATED_LOCATION_ID = String(process.env.GHL_LOCATION_ID || "").trim();
+function getStorageStatePath() {
+  return String(
+    process.env.BROWSER_STORAGE_STATE_PATH ||
+      path.join(__dirname, "..", "browser-state", "ghl-storage-state.json")
+  ).trim();
+}
 
 let session = null;
 let finished = false;
@@ -48,36 +60,74 @@ function normalize(value) {
   return cleanText(value).toLowerCase();
 }
 
-function parseTargetOverride() {
-  const candidates = [
-    process.env.FUNNEL_TARGET_JSON,
-    process.env.FUNNEL_TARGET,
-    process.env.BROWSER_TARGET,
-    process.argv[2],
-  ];
-
-  for (const candidate of candidates) {
-    const value = String(candidate || "").trim();
-    if (!value) {
-      continue;
+function parseDeleteJobsJson() {
+  try {
+    const source = String(process.env.DELETE_JOBS_JSON || "").trim();
+    if (!source) {
+      return { jobs: [], error: "DELETE_JOBS_JSON is required." };
     }
-
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === "object") {
-        return {
-          id: String(parsed.id || "").trim(),
-          name: String(parsed.name || parsed.title || "").trim(),
-          folderId: String(parsed.folderId || parsed.parentId || "").trim() || null,
-          folderName: String(parsed.folderName || parsed.parentName || "").trim() || null,
-        };
-      }
-    } catch {
-      // Ignore and continue.
+    const parsed = JSON.parse(source);
+    if (!Array.isArray(parsed)) {
+      return { jobs: [], error: "DELETE_JOBS_JSON must be a JSON array." };
     }
+    return {
+      jobs: normalizeDeleteJobs(parsed, "funnel"),
+      error: "",
+    };
+  } catch (error) {
+    return { jobs: [], error: `DELETE_JOBS_JSON is invalid: ${error.message}` };
+  }
+}
+
+function selectSingleFunnelJob(jobs) {
+  const parsedJobs = Array.isArray(jobs) ? jobs.filter(Boolean) : [];
+
+  if (parsedJobs.length !== 1) {
+    return {
+      job: null,
+      jobReceived: parsedJobs.length > 0,
+      error:
+        parsedJobs.length === 0
+          ? "No funnel job was provided."
+          : "DELETE_JOBS_JSON must contain exactly one funnel job.",
+    };
   }
 
-  return { id: "", name: "", folderId: null, folderName: null };
+  const job = parsedJobs[0];
+  const normalized = normalizeDeleteJob(job, "funnel");
+  const locationId = toText(normalized.locationId);
+  if (!locationId) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Missing locationId.",
+    };
+  }
+
+  if (AUTHENTICATED_LOCATION_ID && locationId !== AUTHENTICATED_LOCATION_ID) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Funnel job location does not match the authenticated selected location.",
+    };
+  }
+
+  if (!toText(normalized.resourceId) && !toText(normalized.resourceName)) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Missing funnel identity.",
+    };
+  }
+
+  return {
+    job: {
+      ...normalized,
+      locationId,
+    },
+    jobReceived: true,
+    error: "",
+  };
 }
 
 function buildApiClient(headers) {
@@ -274,17 +324,20 @@ async function resolveApiTarget(page) {
     .filter((item) => item.id && item.name);
 
   const { foldersById, foldersByName } = buildFolderLookup(folderList, rootFunnels, folderEntityCounts);
+  if (!TARGET_OVERRIDE || (!TARGET_OVERRIDE.resourceId && !TARGET_OVERRIDE.resourceName)) {
+    throw new Error("DELETE_JOBS_JSON must contain exactly one funnel job.");
+  }
+
   const selectedFolder =
     pickExactFolder(
       foldersById,
       foldersByName,
-      TARGET_OVERRIDE.folderId,
-      TARGET_OVERRIDE.folderName || DEFAULT_FOLDER_NAME
-    ) ||
-    pickExactFolder(foldersById, foldersByName, null, DEFAULT_FOLDER_NAME);
+      TARGET_OVERRIDE.parentId,
+      TARGET_OVERRIDE.parentName
+    );
 
   if (!selectedFolder) {
-    throw new Error(`Unable to resolve folder "${TARGET_OVERRIDE.folderName || DEFAULT_FOLDER_NAME}".`);
+    throw new Error(`Unable to resolve folder "${TARGET_OVERRIDE.parentName || "root"}".`);
   }
 
   const folderFunnelsResponse = await client.get("/funnels/funnel/list", {
@@ -302,29 +355,40 @@ async function resolveApiTarget(page) {
     .map((item) => normalizeFunnelItem(item, new Map([[selectedFolder.id, selectedFolder]])))
     .filter((item) => item.id && item.name);
 
-  const requestedTarget =
-    TARGET_OVERRIDE.id || TARGET_OVERRIDE.name
-      ? {
-          id: TARGET_OVERRIDE.id,
-          name: TARGET_OVERRIDE.name || DEFAULT_FUNNEL_NAME,
-          folderId: TARGET_OVERRIDE.folderId || selectedFolder.id,
-          folderName: TARGET_OVERRIDE.folderName || selectedFolder.name,
-        }
-      : null;
+  const requestedTarget = {
+    id: TARGET_OVERRIDE.resourceId,
+    name: TARGET_OVERRIDE.resourceName,
+    folderId: TARGET_OVERRIDE.parentId || selectedFolder.id,
+    folderName: TARGET_OVERRIDE.parentName || selectedFolder.name,
+  };
 
   if (!folderFunnels.length && !VERIFICATION_ONLY) {
     throw new Error(`No funnel records were returned for folder "${selectedFolder.name}".`);
   }
 
-  const target = VERIFICATION_ONLY && requestedTarget
-    ? requestedTarget
-    : pickExactFunnel(folderFunnels, requestedTarget) ||
-      pickExactFunnel(folderFunnels, { name: DEFAULT_FUNNEL_NAME }) ||
-      folderFunnels[0] ||
-      null;
+  const target = pickExactFunnel(folderFunnels, requestedTarget);
 
   if (!target) {
     throw new Error(`Unable to resolve funnel target for folder "${selectedFolder.name}".`);
+  }
+
+  if (
+    requestedTarget.name &&
+    normalize(target.name) !== normalize(requestedTarget.name)
+  ) {
+    throw new Error(
+      `Resolved funnel name "${target.name}" did not exactly match "${requestedTarget.name}".`
+    );
+  }
+
+  if (
+    requestedTarget.id &&
+    target.id &&
+    normalize(target.id) !== normalize(requestedTarget.id)
+  ) {
+    throw new Error(
+      `Resolved funnel id "${target.id}" did not exactly match "${requestedTarget.id}".`
+    );
   }
 
   return {
@@ -644,6 +708,36 @@ async function main() {
     nothingDeleted: true,
   };
 
+  if (AUTHENTICATED_LOCATION_ID && LOCATION_ID && AUTHENTICATED_LOCATION_ID !== LOCATION_ID) {
+    result.error = "Funnel job location does not match the authenticated selected location.";
+    result.failedStep = "location_guard";
+    result.totalRuntimeMs = Date.now() - startedAt;
+    emit(`[FUNNEL] FAIL step=location_guard error=${result.error}`);
+    emit(`FUNNEL_RESULT_JSON:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (DELETE_JOBS_STATE.error) {
+    result.error = DELETE_JOBS_STATE.error;
+    result.failedStep = "delete_jobs_parse";
+    result.totalRuntimeMs = Date.now() - startedAt;
+    emit(`[FUNNEL] FAIL step=delete_jobs_parse error=${result.error}`);
+    emit(`FUNNEL_RESULT_JSON:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!TARGET_OVERRIDE) {
+    result.error = TARGET_SELECTION.error || "DELETE_JOBS_JSON must contain exactly one funnel job.";
+    result.failedStep = "delete_jobs_select";
+    result.totalRuntimeMs = Date.now() - startedAt;
+    emit(`[FUNNEL] FAIL step=delete_jobs_select error=${result.error}`);
+    emit(`FUNNEL_RESULT_JSON:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
+  }
+
   const watchdog = setTimeout(async () => {
     if (finished) {
       return;
@@ -668,6 +762,7 @@ async function main() {
       discoveryTimeoutMs: 15000,
       sessionTimeoutMs: 300000,
       pageTimeoutMs: NAVIGATION_WAIT_MS,
+      storageStatePath: getStorageStatePath(),
     });
     emit("[FUNNEL] connected");
 
@@ -870,20 +965,42 @@ async function main() {
   }
 }
 
-main().catch(async (error) => {
-  const result = {
-    success: false,
-    dryRunSuccess: false,
-    failedStep: "unhandled",
-    error: formatBrowserlessError(error),
-    runtimeMs: Date.now() - startedAt,
-    totalRuntimeMs: Date.now() - startedAt,
-    nothingDeleted: true,
-  };
+if (require.main === module) {
+  main().catch(async (error) => {
+    const result = {
+      success: false,
+      dryRunSuccess: false,
+      failedStep: "unhandled",
+      error: formatBrowserlessError(error),
+      runtimeMs: Date.now() - startedAt,
+      totalRuntimeMs: Date.now() - startedAt,
+      nothingDeleted: true,
+    };
 
-  emit(`[FUNNEL] FAIL step=unhandled error=${result.error}`);
-  emit(`FUNNEL_RESULT_JSON:${JSON.stringify(result)}`);
-  finished = true;
-  await closeV2BrowserlessSession(session).catch(() => {});
-  process.exit(1);
-});
+    emit(`[FUNNEL] FAIL step=unhandled error=${result.error}`);
+    emit(`FUNNEL_RESULT_JSON:${JSON.stringify(result)}`);
+    finished = true;
+    await closeV2BrowserlessSession(session).catch(() => {});
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  buildApiClient,
+  buildFolderLookup,
+  closeV2BrowserlessSession,
+  connectV2Browserless,
+  emit,
+  findExactRow,
+  findRowActionsFast,
+  findSearchInput,
+  isExactVisibleRowText,
+  main,
+  normalizeFunnelItem,
+  parseDeleteJobsJson,
+  pickExactFunnel,
+  pickExactFolder,
+  selectSingleFunnelJob,
+  resolveApiTarget,
+  verifyTargetAbsent,
+};

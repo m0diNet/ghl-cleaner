@@ -1,4 +1,9 @@
 const axios = require("axios");
+const { normalizeDeleteJob, toText } = require("./deleteJob");
+const {
+  buildCustomValueInventory,
+  extractCustomValueItems,
+} = require("./customValuesImport");
 
 const BASE_URL = "https://services.leadconnectorhq.com";
 
@@ -34,20 +39,42 @@ function firstNumber(data, paths) {
 }
 
 function itemId(item) {
-  return item?.id || item?._id || item?.workflowId || item?.funnelId || item?.formId || item?.linkId || item?.tagId || item?.customFieldId || item?.customValueId || null;
+  return toText(
+    item?.resourceId ||
+      item?.id ||
+      item?._id ||
+      item?.workflowId ||
+      item?.funnelId ||
+      item?.formId ||
+      item?.linkId ||
+      item?.tagId ||
+      item?.customFieldId ||
+      item?.customValueId ||
+      ""
+  );
 }
 
 function itemName(item) {
-  return item?.name || item?.title || item?.fieldKey || item?.key || item?.value || item?.displayName || "Unnamed item";
+  return toText(
+    item?.resourceName ||
+      item?.name ||
+      item?.title ||
+      item?.fieldKey ||
+      item?.key ||
+      item?.value ||
+      item?.displayName ||
+      "Unnamed item"
+  );
 }
 
-function normalizeRaw(raw, category) {
+function normalizeRaw(raw, category, locationId) {
   const unique = new Map();
   let missingIds = 0;
   let duplicateIds = 0;
 
   for (const source of raw) {
-    const id = String(itemId(source) || "").trim();
+    const normalized = normalizeDeleteJob(source, category, locationId);
+    const id = String(normalized?.resourceId || "").trim();
     if (!id) {
       missingIds += 1;
       continue;
@@ -57,8 +84,9 @@ function normalizeRaw(raw, category) {
       continue;
     }
     unique.set(id, {
+      ...normalized,
       id,
-      name: String(itemName(source)).trim(),
+      name: String(normalized.resourceName || itemName(source)).trim(),
       type: category,
       realId: true,
     });
@@ -71,8 +99,8 @@ function normalizeRaw(raw, category) {
   return { items, missingIds, duplicateIds };
 }
 
-function makeResult({ category, raw, data, totalPaths = [] }) {
-  const { items, missingIds, duplicateIds } = normalizeRaw(raw, category);
+function makeResult({ category, raw, data, totalPaths = [], locationId }) {
+  const { items, missingIds, duplicateIds } = normalizeRaw(raw, category, locationId);
   const reportedTotal = firstNumber(data, totalPaths);
   const countMatches = reportedTotal === null || reportedTotal === items.length;
   const verified = missingIds === 0 && duplicateIds === 0 && countMatches;
@@ -100,10 +128,10 @@ function makeResult({ category, raw, data, totalPaths = [] }) {
   };
 }
 
-async function requestList({ token, version, endpoint, params, category, arrayPaths, totalPaths = [] }) {
+async function requestList({ token, version, endpoint, params, category, arrayPaths, totalPaths = [], locationId = "" }) {
   const response = await createClient(token, version).get(endpoint, { params });
   const raw = firstArray(response.data, arrayPaths);
-  return makeResult({ category, raw, data: response.data, totalPaths });
+  return makeResult({ category, raw, data: response.data, totalPaths, locationId });
 }
 
 async function scanTags(values) {
@@ -115,6 +143,7 @@ async function scanTags(values) {
     params: undefined,
     arrayPaths: ["tags", "data.tags"],
     totalPaths: ["total", "count", "meta.total"],
+    locationId: values.locationId,
   });
 }
 
@@ -127,19 +156,44 @@ async function scanCustomFields(values) {
     params: { model: "all" },
     arrayPaths: ["customFields", "fields", "data.customFields", "data.fields"],
     totalPaths: ["total", "count", "meta.total"],
+    locationId: values.locationId,
   });
 }
 
 async function scanCustomValues(values) {
-  return requestList({
-    ...values,
+  const client = createClient(values.token, "2021-07-28");
+  const response = await client.get(`/locations/${values.locationId}/customValues`);
+  const raw = extractCustomValueItems(response.data);
+  const inventory = buildCustomValueInventory(raw);
+  const result = makeResult({
     category: "customValues",
-    endpoint: `/locations/${values.locationId}/customValues`,
-    version: "2021-07-28",
-    params: undefined,
-    arrayPaths: ["customValues", "values", "data.customValues", "data.values"],
-    totalPaths: ["total", "count", "meta.total"],
+    raw: inventory.items,
+    data: response.data,
+    totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
+    locationId: values.locationId,
   });
+
+  result.items = inventory.items.map((item) => ({
+    ...item,
+    id: item.id,
+    name: item.name,
+    value: item.value,
+    folderId: item.folderId,
+    folderName: item.folderName,
+    metadata: item.metadata,
+  }));
+  result.folders = inventory.folders;
+  result.reportedTotal =
+    firstNumber(response.data, ["total", "count", "meta.total", "data.total", "data.count"]) ??
+    result.loadedCount;
+  result.count = result.loadedCount;
+  result.verified =
+    result.missingIds === 0 &&
+    result.duplicateIds === 0 &&
+    result.loadedCount === result.reportedTotal;
+  result.status = result.verified ? "verified" : "incomplete";
+  result.error = result.verified ? null : `loaded ${result.loadedCount} of ${result.reportedTotal}`;
+  return result;
 }
 
 async function scanTriggerLinks(values) {
@@ -151,6 +205,7 @@ async function scanTriggerLinks(values) {
     params: { locationId: values.locationId },
     arrayPaths: ["links", "triggerLinks", "data.links", "data.triggerLinks", "data"],
     totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
+    locationId: values.locationId,
   });
 }
 
@@ -163,6 +218,7 @@ async function scanWorkflows(values) {
     params: { locationId: values.locationId },
     arrayPaths: ["workflows", "data.workflows", "data"],
     totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
+    locationId: values.locationId,
   });
 }
 
@@ -175,6 +231,7 @@ async function scanFunnels(values) {
     params: { locationId: values.locationId },
     arrayPaths: ["funnels", "data.funnels", "data"],
     totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
+    locationId: values.locationId,
   });
 }
 
@@ -226,6 +283,7 @@ async function scanForms(values) {
     raw,
     data: lastData || {},
     totalPaths: [],
+    locationId: values.locationId,
   });
 
   result.reportedTotal = reportedTotal ?? result.loadedCount;

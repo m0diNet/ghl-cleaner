@@ -16,12 +16,17 @@ const {
 const LOCATION_ID = String(process.env.GHL_LOCATION_ID || "").trim();
 const FOLDER_NAME = String(process.env.CUSTOM_VALUE_FOLDER_NAME || "").trim();
 const GHL_TOKEN = String(process.env.GHL_TOKEN || "").trim();
-const STORAGE_STATE_PATH = path.join(
-  __dirname,
-  "..",
-  "browser-state",
-  "ghl-storage-state.json"
-);
+function getStorageStatePath() {
+  return String(
+    process.env.BROWSER_STORAGE_STATE_PATH ||
+      path.join(
+        __dirname,
+        "..",
+        "browser-state",
+        "ghl-storage-state.json"
+      )
+  ).trim();
+}
 const CUSTOM_VALUES_BASE_URL = "https://services.leadconnectorhq.com";
 const CUSTOM_VALUES_API_VERSION = "2021-07-28";
 const CUSTOM_VALUES_ORIGIN = "https://app.olspsystem.com";
@@ -316,7 +321,7 @@ async function createLocalSession(storageStatePath) {
 async function openSessionWithLocalFallback() {
   if (CUSTOM_VALUES_BROWSER_MODE === "local") {
     return {
-      ...(await createLocalSession(STORAGE_STATE_PATH)),
+      ...(await createLocalSession(getStorageStatePath())),
       mode: "local",
     };
   }
@@ -369,7 +374,7 @@ async function openSessionWithLocalFallback() {
       "[CUSTOM VALUES] Browserless unavailable, falling back to local storage state"
     );
     return {
-      ...(await createLocalSession(STORAGE_STATE_PATH)),
+      ...(await createLocalSession(getStorageStatePath())),
       mode: "local",
     };
   }
@@ -655,7 +660,7 @@ async function main() {
     return summary;
   } finally {
     if (session) {
-      await saveBrowserlessStorageState(session.context, STORAGE_STATE_PATH).catch(
+      await saveBrowserlessStorageState(session.context, getStorageStatePath()).catch(
         () => {}
       );
       await closeBrowserlessSession(session).catch(() => {});
@@ -663,7 +668,18 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(formatBrowserlessError(error));
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(formatBrowserlessError(error));
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  createLocalSession,
+  ensureFolder,
+  ensureValue,
+  openCustomValuesPage,
+  openSessionWithLocalFallback,
+  verifyCustomValuesPage,
+};

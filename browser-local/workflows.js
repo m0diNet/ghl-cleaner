@@ -14,11 +14,20 @@ const {
   canonicalizeRowNameFromText,
   getInventoryRowSelectors,
 } = require("../services/browser-inventory-shared");
+const {
+  normalizeDeleteJob,
+  normalizeDeleteJobs,
+  toText,
+} = require("../web/services/deleteJob");
 
-const LOCATION_ID = "J7y3jQR55TZrKEOB1yQ2";
 const AUTH_ORIGIN = "https://app.olspsystem.com";
-const WORKFLOWS_URL = `${AUTH_ORIGIN}/v2/location/${LOCATION_ID}/automation/workflows?listTab=all`;
-const STORAGE_STATE_PATH = path.join(__dirname, "..", "browser-state", "ghl-storage-state.json");
+function getStorageStatePath() {
+  return String(
+    process.env.BROWSER_STORAGE_STATE_PATH ||
+      path.join(__dirname, "..", "browser-state", "ghl-storage-state.json")
+  ).trim();
+}
+const ROOT_FOLDER_LABEL = "Home";
 
 const WORKFLOW_FRAME_FRAGMENT = "client-app-automation-workflows.leadconnectorhq.com";
 const FRAME_WAIT_MS = 120000;
@@ -27,6 +36,7 @@ const ROOT_SCOPE_WAIT_MS = 30000;
 const FOLDER_OPEN_WAIT_MS = 30000;
 const RETURN_ROOT_WAIT_MS = 120000;
 const DELETE_VERIFY_WAIT_MS = 3000;
+const AUTHENTICATED_LOCATION_ID = toText(process.env.GHL_LOCATION_ID || "");
 
 const CRITICAL_PATTERNS = [
   /\butilities?\b/i,
@@ -124,15 +134,7 @@ async function getVisibleWorkflowFrame(page, timeoutMs = FRAME_WAIT_MS) {
     );
 
     if (frame) {
-      const buttons = frame.locator('[aria-label="Workflow list actions"]');
-      const count = await buttons.count().catch(() => 0);
-
-      for (let index = 0; index < count; index += 1) {
-        const button = buttons.nth(index);
-        if (await isVisible(button)) {
-          return frame;
-        }
-      }
+      return frame;
     }
 
     await page.waitForTimeout(500);
@@ -217,11 +219,7 @@ function pickPreferredFolder(rows) {
     return null;
   }
 
-  const preferred = safeFolders.find(
-    (row) => normalizeSignatureText(row.name) === normalizeSignatureText(".01.00 | MegaLink - Dec25")
-  );
-
-  return preferred || safeFolders[0];
+  return safeFolders[0];
 }
 
 function findMatchingFolderRow(rows, folderName) {
@@ -247,6 +245,120 @@ function looksDangerousWorkflowName(value) {
     /\bSystem\b/i,
     /\bAdmin\b/i,
   ].some((pattern) => pattern.test(String(value || "")));
+}
+
+function getWorkflowsUrl(locationId) {
+  const trimmed = toText(locationId);
+  return `${AUTH_ORIGIN}/v2/location/${trimmed}/automation/workflows?listTab=all`;
+}
+
+function parseDeleteJobsFromEnv() {
+  const source = String(process.env.DELETE_JOBS_JSON || "").trim();
+  if (!source) {
+    return { jobs: [], error: "DELETE_JOBS_JSON is required." };
+  }
+
+  try {
+    const parsed = JSON.parse(source);
+    if (!Array.isArray(parsed)) {
+      return { jobs: [], error: "DELETE_JOBS_JSON must be a JSON array." };
+    }
+    const normalized = parsed.map((item) => normalizeDeleteJob(item, "workflow"));
+    return { jobs: normalized };
+  } catch (error) {
+    return { jobs: [], error: `DELETE_JOBS_JSON is invalid: ${error.message}` };
+  }
+}
+
+function selectSingleWorkflowJob(jobs) {
+  const parsedJobs = Array.isArray(jobs) ? jobs.filter(Boolean) : [];
+
+  if (parsedJobs.length !== 1) {
+    return {
+      job: null,
+      jobReceived: parsedJobs.length > 0,
+      error:
+        parsedJobs.length === 0
+          ? "No workflow job was provided."
+          : "DELETE_JOBS_JSON must contain exactly one workflow job.",
+    };
+  }
+
+  const job = parsedJobs[0];
+  const resourceType = toText(job.resourceType);
+  if (resourceType && resourceType !== "workflow") {
+    return {
+      job: null,
+      jobReceived: true,
+      error: `Unsupported resourceType "${resourceType}".`,
+    };
+  }
+
+  const locationId = toText(job.locationId);
+  if (!locationId) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Missing locationId.",
+    };
+  }
+
+  if (AUTHENTICATED_LOCATION_ID && locationId !== AUTHENTICATED_LOCATION_ID) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Workflow job location does not match the authenticated selected location.",
+    };
+  }
+
+  if (!toText(job.resourceId)) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Missing resourceId.",
+    };
+  }
+
+  if (!toText(job.resourceName)) {
+    return {
+      job: null,
+      jobReceived: true,
+      error: "Missing resourceName.",
+    };
+  }
+
+  return {
+    job,
+    jobReceived: true,
+    error: "",
+  };
+}
+
+function hasProtectedWorkflowName(value) {
+  const text = toText(value);
+  return (
+    /DO NOT REMOVE/i.test(text) ||
+    /\bUtilities\b/i.test(text) ||
+    /\bWebhooks\b/i.test(text)
+  );
+}
+
+function isRootFolderTarget(job) {
+  const parentName = toText(job?.parentName);
+  return !parentName || normalizeSignatureText(parentName) === normalizeSignatureText(ROOT_FOLDER_LABEL);
+}
+
+async function getRowResourceId(rowLocator) {
+  const link = rowLocator.locator('a[role="link"], a[href], [role="link"]').first();
+  const id = cleanText(await link.getAttribute("id").catch(() => ""));
+  return id || "";
+}
+
+async function resolveWorkflowRowIdentity(rowDescriptor) {
+  return {
+    resolvedRowName: rowDescriptor.name || rowDescriptor.rowText || "",
+    resolvedResourceId: await getRowResourceId(rowDescriptor.locator),
+  };
 }
 
 async function findRowActionButtons(row) {
@@ -667,411 +779,342 @@ async function openFolderScope(page, folderRow) {
   ) || page.mainFrame(), FOLDER_OPEN_WAIT_MS);
 }
 
-async function returnToRootAndGetFrame(page) {
-  await page.goto(WORKFLOWS_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+async function returnToRootAndGetFrame(page, locationId) {
+  await page.goto(getWorkflowsUrl(locationId), { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
   return getVisibleWorkflowFrame(page, RETURN_ROOT_WAIT_MS);
 }
 
 async function main() {
   const startedAt = Date.now();
+  const dryRun = String(process.env.WORKFLOW_DRY_RUN || "").trim().toLowerCase() === "true";
+  const markerName = dryRun ? "WORKFLOW_TARGET_RESOLUTION_JSON" : "WORKFLOW_DELETE_RESULT_JSON";
   const result = {
-    topLevelRows: [],
-    folders: [],
-    folderName: "",
-    folderOpened: false,
-    insideRowCount: 0,
-    rows: [],
-    actualWorkflowCandidates: [],
-    folderName: "",
-    targetWorkflowName: "",
-    actionsClicked: false,
-    deleteWorkflowVisible: false,
-    deleteWorkflowClicked: false,
-    confirmationVisible: false,
-    typedDelete: false,
-    finalDeleteClicked: false,
-    targetAlreadyAbsent: false,
-    workflowDisappeared: false,
-    workflowAbsentAfterRefresh: false,
+    jobReceived: false,
+    locationId: "",
+    resourceId: "",
+    resourceName: "",
+    parentId: "",
+    parentName: "",
+    parentResolved: false,
+    parentResolvedBy: "",
+    targetFound: false,
+    targetResolvedBy: "",
+    resolvedRowName: "",
+    resolvedResourceId: "",
+    actionsFound: false,
+    deleteWouldBeAvailable: false,
+    deleteVisible: false,
+    deleteClicked: false,
+    confirmationCompleted: false,
+    rowDisappeared: false,
+    rowAbsentAfterRefresh: false,
     uiVerificationPassed: false,
-    wrongTargetType: false,
+    protectedTarget: false,
+    dryRun,
     status: "failed",
-    workflowFrameUrl: "",
-    topLevelRowCount: 0,
-    folderCount: 0,
-    actualWorkflowCandidateCount: 0,
     runtimeMs: 0,
     error: "",
   };
 
-  if (!fs.existsSync(STORAGE_STATE_PATH)) {
-    throw new Error(`Storage state not found at ${STORAGE_STATE_PATH}`);
+  const { jobs, error: jobsError } = parseDeleteJobsFromEnv();
+  if (jobsError) {
+    result.error = jobsError;
+    result.runtimeMs = Date.now() - startedAt;
+    console.log(`${markerName}:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
   }
 
-  const browser = await chromium.launch({
-    headless: false,
-  });
+  const selection = selectSingleWorkflowJob(jobs);
+  if (!selection.job) {
+    result.error = selection.error;
+    result.runtimeMs = Date.now() - startedAt;
+    console.log(`${markerName}:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const job = selection.job;
+  result.jobReceived = selection.jobReceived;
+  result.locationId = toText(job.locationId);
+  result.resourceId = toText(job.resourceId);
+  result.resourceName = toText(job.resourceName);
+  result.parentId = toText(job.parentId);
+  result.parentName = toText(job.parentName);
+
+  if (hasProtectedWorkflowName(result.parentName) || hasProtectedWorkflowName(result.resourceName)) {
+    result.protectedTarget = true;
+    result.error = "Protected workflow target rejected.";
+    result.runtimeMs = Date.now() - startedAt;
+    console.log(`${markerName}:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const storageStatePath = getStorageStatePath();
+  if (!fs.existsSync(storageStatePath)) {
+    throw new Error(`Storage state not found at ${storageStatePath}`);
+  }
+
+  const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext({
-    storageState: STORAGE_STATE_PATH,
+    storageState: storageStatePath,
     viewport: null,
   });
-  let page = null;
-
-  const workflowCandidates = new Map();
-  const folderRecords = new Map();
 
   try {
-    page = await context.newPage();
+    const page = await context.newPage();
     page.setDefaultTimeout(10000);
     page.setDefaultNavigationTimeout(30000);
 
-    console.log("[WORKFLOW-INVENTORY] launched");
-
-    await page.goto(WORKFLOWS_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(getWorkflowsUrl(result.locationId), {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
 
     const frame = await getVisibleWorkflowFrame(page, FRAME_WAIT_MS);
     result.workflowFrameUrl = frame.url();
-    console.log("[WORKFLOW-INVENTORY] workflow frame ready");
 
     const rootRows = await waitForCurrentScope(frame, ROOT_SCOPE_WAIT_MS);
-    console.log("[WORKFLOW-INVENTORY] top-level rows found");
+    let scopeFrame = frame;
+    let scopeRows = rootRows;
+    let folderRow = null;
 
-    for (const row of rootRows) {
-      const rowName = row.name || row.rowText;
-      const protectedRow = isProtectedRowName(rowName) || isProtectedRowName(row.rowText);
-      const criticalRow = isCriticalRowName(rowName) || isCriticalRowName(row.rowText);
-      const rootEntry = {
-        name: rowName,
-        rowText: row.rowText,
-        type: "unknown",
-        protected: protectedRow,
-        safeToOpen: false,
-        actionButtonCount: 0,
-      };
+    if (!isRootFolderTarget(job)) {
+      folderRow =
+        findMatchingFolderRow(rootRows, result.parentName) ||
+        rootRows.find((row) => normalizeSignatureText(row.name || row.rowText) === normalizeSignatureText(result.parentId));
 
-      if (protectedRow) {
-        rootEntry.type = "protected_folder";
-        result.topLevelRows.push(rootEntry);
-        folderRecords.set(rowName, {
-          name: rowName,
-          protected: true,
-          workflows: [],
-        });
-        continue;
+      if (!folderRow) {
+        result.error = `Parent folder not found for "${result.parentName}".`;
+        result.runtimeMs = Date.now() - startedAt;
+        console.log(`${markerName}:${JSON.stringify(result)}`);
+        process.exitCode = 1;
+        return;
       }
 
-      if (criticalRow) {
-        rootEntry.type = "skipped_critical";
-        rootEntry.safeToOpen = false;
-        result.topLevelRows.push(rootEntry);
-        continue;
-      }
+      await clickRowTitle(folderRow.locator, folderRow.name || folderRow.rowText);
+      await page.waitForTimeout(1500);
+      scopeFrame = await getVisibleWorkflowFrame(page, RETURN_ROOT_WAIT_MS);
+      scopeRows = await waitForCurrentScope(scopeFrame, FOLDER_OPEN_WAIT_MS);
+      result.parentResolvedBy = folderRow.name ? "parentName" : "parentId";
+    } else {
+      result.parentResolvedBy = "root";
+    }
 
-      const classification = await inspectRowMenu(page, frame, row);
-      rootEntry.actionButtonCount = classification.actionButtonCount;
-      rootEntry.type = classification.type;
-      rootEntry.safeToOpen = classification.type === "folder" || classification.type === "folder_candidate";
-      rootEntry.menuLabels = classification.menuLabels;
-      rootEntry.menuText = classification.menuText;
-      result.topLevelRows.push(rootEntry);
+    result.parentResolved = true;
 
-      if (classification.type === "workflow" && isSafeCandidateName(rowName)) {
-        const candidate = {
-          name: rowName,
-          folderName: null,
-          type: "workflow",
-          source: "top-level",
-        };
-        const key = `${candidate.folderName || ""}::${candidate.name}`;
-        if (!workflowCandidates.has(key)) {
-          workflowCandidates.set(key, candidate);
-        }
-      }
-
-      if (rootEntry.safeToOpen && isSafeCandidateName(rowName)) {
-        folderRecords.set(rowName, {
-          name: rowName,
-          protected: false,
-          workflows: [],
-        });
+    let targetRow = null;
+    let targetResolvedBy = "";
+    for (const row of scopeRows) {
+      const rowIdentity = await getRowResourceId(row.locator);
+      if (rowIdentity && normalizeSignatureText(rowIdentity) === normalizeSignatureText(result.resourceId)) {
+        targetRow = row;
+        targetResolvedBy = "resourceId";
+        break;
       }
     }
 
-    result.folders = Array.from(folderRecords.values());
-    result.topLevelRowCount = result.topLevelRows.length;
-    result.folderCount = result.folders.length;
-    const chosenFolder = pickPreferredFolder(result.topLevelRows);
-
-    if (chosenFolder) {
-      result.folderName = normalizeSignatureText(chosenFolder.name) || chosenFolder.name;
-      console.log(`[WORKFLOW-INVENTORY] opening folder: ${result.folderName}`);
-      const chosenFolderRow = findMatchingFolderRow(rootRows, chosenFolder.name);
-      if (!chosenFolderRow) {
-        throw new Error(`Folder row not found for ${chosenFolder.name}`);
-      }
-
-      await clickRowTitle(chosenFolderRow.locator, chosenFolderRow.name || chosenFolderRow.rowText);
-      await page.waitForTimeout(1500);
-
-      const folderFrame = await getVisibleWorkflowFrame(page, RETURN_ROOT_WAIT_MS);
-      await waitForActionButtons(folderFrame, ROOT_SCOPE_WAIT_MS);
-
-      const innerRows = await waitForCurrentScope(folderFrame, FOLDER_OPEN_WAIT_MS);
-      result.folderOpened = innerRows.length > 0;
-      console.log("[WORKFLOW-INVENTORY] folder opened");
-      console.log("[WORKFLOW-INVENTORY] inside rows found");
-
-      const folderRecord = {
-        name: result.folderName,
-        protected: false,
-        workflows: [],
-      };
-
-      const candidateRows = innerRows.filter((row) => !isProtectedRowName(row.name || row.rowText));
-      const targetRow =
-        candidateRows.find((row) => !looksDangerousWorkflowName(row.name || row.rowText)) ||
-        candidateRows[0] ||
+    if (!targetRow) {
+      targetRow =
+        scopeRows.find((row) => normalizeSignatureText(row.name || row.rowText) === normalizeSignatureText(result.resourceName)) ||
+        scopeRows.find((row) => normalizeSignatureText(row.rowText) === normalizeSignatureText(result.resourceName)) ||
         null;
-
-      if (!targetRow) {
-        result.targetAlreadyAbsent = true;
-        result.workflowDisappeared = true;
-        result.workflowAbsentAfterRefresh = true;
-        result.uiVerificationPassed = true;
-        result.status = "deleted";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log("[WORKFLOW-DELETE] launched");
-        console.log("[WORKFLOW-DELETE] folder opened");
-        console.log("[WORKFLOW-DELETE] target workflow found");
-        console.log("[WORKFLOW-DELETE] DELETE SUCCESS");
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
+      if (targetRow) {
+        targetResolvedBy = "resourceName";
       }
+    }
 
-      result.targetWorkflowName = targetRow.name || targetRow.rowText;
-      if (looksDangerousWorkflowName(result.targetWorkflowName)) {
-        result.wrongTargetType = true;
-        result.error = `Target workflow "${result.targetWorkflowName}" failed safety guard.`;
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      console.log("[WORKFLOW-DELETE] launched");
-      console.log("[WORKFLOW-DELETE] folder opened");
-      console.log("[WORKFLOW-DELETE] target workflow found");
-
-      const actionButton = await findRowActionButtons(targetRow.locator).then((items) =>
-        items.find((item) => item.visible && item.enabled)
-      );
-      if (!actionButton) {
-        result.error = "Exact row-local Actions button was not found for target workflow.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      await actionButton.locator.scrollIntoViewIfNeeded().catch(() => {});
-      await actionButton.locator.click({ timeout: 5000 }).catch((error) => {
-        throw new Error(`Failed to open target workflow actions: ${error.message}`);
-      });
-      result.actionsClicked = true;
-      console.log("[WORKFLOW-DELETE] exact row Actions clicked");
-
-      const deleteWorkflowItem = await findVisibleMenuItem(page, folderFrame, "Delete workflow", MENU_WAIT_MS);
-      const deleteFolderItem = await findVisibleMenuItem(page, folderFrame, "Delete folder", MENU_WAIT_MS);
-      result.deleteWorkflowVisible = Boolean(deleteWorkflowItem);
-      if (deleteFolderItem && !deleteWorkflowItem) {
-        result.wrongTargetType = true;
-        result.error = "Delete folder was visible instead of Delete workflow.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      if (!deleteWorkflowItem) {
-        result.error = "Delete workflow was not visible.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      console.log("[WORKFLOW-DELETE] Delete workflow visible");
-      await deleteWorkflowItem.click({ timeout: 5000 }).catch((error) => {
-        throw new Error(`Failed to click Delete workflow: ${error.message}`);
-      });
-      result.deleteWorkflowClicked = true;
-      console.log("[WORKFLOW-DELETE] Delete workflow clicked");
-
-      const dialogs = await collectDialogsFromScope(folderFrame, "frame");
-      result.dialogsFound = dialogs.length;
-      result.dialogs = dialogs;
-      result.confirmationVisible = dialogs.length > 0;
-
-      const dialog = await findVisibleDialogInScope(folderFrame);
-
-      if (!dialog) {
-        result.error = "No confirmation dialog was visible after Delete workflow click.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      console.log("[WORKFLOW-DELETE] confirmation visible");
-
-      const confirmationInput =
-        (await dialog.locator('input[placeholder="Delete"], textarea[placeholder="Delete"]').first().isVisible().catch(() => false)
-          ? dialog.locator('input[placeholder="Delete"], textarea[placeholder="Delete"]').first()
-          : null) ||
-        (await dialog.getByPlaceholder("Delete").first().isVisible().catch(() => false)
-          ? dialog.getByPlaceholder("Delete").first()
-          : null);
-
-      if (!confirmationInput) {
-        result.error = "Confirmation input was not found.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      await confirmationInput.fill("Delete", { timeout: 5000 }).catch(() => {});
-      result.typedDelete = true;
-      console.log("[WORKFLOW-DELETE] typed Delete");
-
-      const finalDeleteButton =
-        (await dialog.getByRole("button", { name: /^Delete$/i }).first().isVisible().catch(() => false)
-          ? dialog.getByRole("button", { name: /^Delete$/i }).first()
-          : null) ||
-        (await dialog.getByText(/^Delete$/i).first().isVisible().catch(() => false)
-          ? dialog.getByText(/^Delete$/i).first()
-          : null);
-
-      if (!finalDeleteButton) {
-        result.error = "Final Delete button was not found.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      await finalDeleteButton.click({ timeout: 5000 }).catch((error) => {
-        throw new Error(`Failed to click final Delete: ${error.message}`);
-      });
-      result.finalDeleteClicked = true;
-      console.log("[WORKFLOW-DELETE] final Delete clicked");
-
-      await page.waitForTimeout(DELETE_VERIFY_WAIT_MS);
-
-      const postRefresh = await refreshAndReopenFolder(page, chosenFolderRow);
-      if (!postRefresh.folderOpened) {
-        result.error = "Unable to reopen folder after delete.";
-        result.runtimeMs = Date.now() - startedAt;
-        console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
-        return;
-      }
-
-      const freshRows = postRefresh.reopenedRows || [];
-      const stillPresent = freshRows.some((row) =>
-        normalizeSignatureText(row.name || row.rowText) === normalizeSignatureText(result.targetWorkflowName)
-      );
-
-      result.workflowDisappeared = !stillPresent;
-      result.workflowAbsentAfterRefresh = !stillPresent;
-      result.uiVerificationPassed = !stillPresent;
-
-      if (!stillPresent) {
-        result.status = "deleted";
-        result.error = "";
-        console.log("[WORKFLOW-DELETE] workflow absent after refresh");
-        console.log("[WORKFLOW-DELETE] DELETE SUCCESS");
-      } else {
-        result.status = "verification_failed";
-        result.error = `Target workflow still present after refresh: ${result.targetWorkflowName}`;
-      }
-
+    if (!targetRow) {
+      result.error = `Workflow "${result.resourceName}" was not found.`;
       result.runtimeMs = Date.now() - startedAt;
-      console.log(`WORKFLOW_DELETE_RESULT_JSON:${JSON.stringify(result)}`);
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
       return;
     }
-    for (const row of innerRows) {
-      const rowName = row.name || row.rowText;
-      const protectedRow = isProtectedRowName(rowName) || isProtectedRowName(row.rowText);
-      const criticalRow = isCriticalRowName(rowName) || isCriticalRowName(row.rowText);
 
-      if (protectedRow) {
-        const entry = {
-          name: rowName,
-          type: "protected_folder",
-          menuLabels: [],
-        };
-        result.rows.push(entry);
-        folderRecord.workflows.push({
-          name: rowName,
-          type: "protected_folder",
-        });
-        continue;
-      }
+    result.targetFound = true;
+    result.targetResolvedBy = targetResolvedBy;
+    result.resolvedRowName = targetRow.name || targetRow.rowText || "";
+    result.resolvedResourceId = await getRowResourceId(targetRow.locator);
 
-      if (criticalRow) {
-        const entry = {
-          name: rowName,
-          type: "skipped_critical",
-          menuLabels: [],
-        };
-        result.rows.push(entry);
-        folderRecord.workflows.push({
-          name: rowName,
-          type: "skipped_critical",
-        });
-        continue;
-      }
-
-      const classification = await inspectRowMenu(page, folderFrame, row);
-      const entry = {
-        name: rowName,
-        type: classification.type,
-        menuLabels: classification.menuLabels,
-      };
-      result.rows.push(entry);
-      folderRecord.workflows.push({
-        name: rowName,
-        type: classification.type,
-      });
-
-      if (classification.type === "workflow" && isSafeCandidateName(rowName)) {
-        console.log(`[WORKFLOW-INVENTORY] actual workflow: ${rowName}`);
-        const candidate = {
-          name: rowName,
-          folderName: result.folderName,
-          type: "workflow",
-          source: result.folderName,
-        };
-        const key = `${candidate.folderName || ""}::${candidate.name}`;
-        if (!workflowCandidates.has(key)) {
-          workflowCandidates.set(key, candidate);
-        }
-      }
+    if (normalizeSignatureText(result.resolvedRowName) !== normalizeSignatureText(result.resourceName)) {
+      result.error = `Workflow row name "${result.resolvedRowName}" did not exactly match "${result.resourceName}".`;
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
     }
 
-    result.folders = [folderRecord];
-    result.insideRowCount = result.rows.length;
+    if (
+      result.resolvedResourceId &&
+      normalizeSignatureText(result.resolvedResourceId) !== normalizeSignatureText(result.resourceId)
+    ) {
+      result.error = `Workflow row id "${result.resolvedResourceId}" did not exactly match "${result.resourceId}".`;
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
 
-    result.actualWorkflowCandidates = Array.from(workflowCandidates.values());
-    result.actualWorkflowCandidateCount = result.actualWorkflowCandidates.length;
+    if (hasProtectedWorkflowName(result.resolvedRowName) || hasProtectedWorkflowName(result.parentName)) {
+      result.protectedTarget = true;
+      result.error = "Protected workflow target rejected.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const actionButton = await findRowActionButtons(targetRow.locator).then((items) =>
+      items.find((item) => item.visible && item.enabled)
+    );
+
+    result.actionsFound = Boolean(actionButton);
+    if (!actionButton) {
+      result.error = "Exact row-local Actions button was not found.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    if (dryRun) {
+      await actionButton.locator.scrollIntoViewIfNeeded().catch(() => {});
+      await actionButton.locator.click({ timeout: 5000 }).catch((error) => {
+        throw new Error(`Failed to open target workflow actions for dry-run: ${error.message}`);
+      });
+      const { menuLabels } = await waitForMenuLabels(page, scopeFrame, MENU_WAIT_MS);
+      const deleteWorkflowItem = await findVisibleMenuItem(page, scopeFrame, "Delete workflow", MENU_WAIT_MS);
+      result.deleteVisible = Boolean(deleteWorkflowItem) || menuLabels.some((label) => /delete workflow/i.test(label));
+      result.deleteWouldBeAvailable = result.deleteVisible;
+      result.actionsFound = true;
+      await page.keyboard.press("Escape").catch(() => {});
+      result.status = "resolved";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      return;
+    }
+
+    await actionButton.locator.scrollIntoViewIfNeeded().catch(() => {});
+    await actionButton.locator.click({ timeout: 5000 }).catch((error) => {
+      throw new Error(`Failed to open target workflow actions: ${error.message}`);
+    });
+    result.deleteVisible = true;
+
+    const deleteWorkflowItem = await findVisibleMenuItem(page, scopeFrame, "Delete workflow", MENU_WAIT_MS);
+    if (!deleteWorkflowItem) {
+      result.error = "Delete workflow was not visible.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    await deleteWorkflowItem.click({ timeout: 5000 }).catch((error) => {
+      throw new Error(`Failed to click Delete workflow: ${error.message}`);
+    });
+    result.deleteClicked = true;
+
+    const dialog = await findVisibleDialogInScope(scopeFrame) || await findVisibleDialogInScope(page);
+    if (!dialog) {
+      result.error = "No confirmation dialog was visible after Delete workflow click.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const confirmationInput =
+      (await dialog.locator('input[placeholder="Delete"], textarea[placeholder="Delete"]').first().isVisible().catch(() => false)
+        ? dialog.locator('input[placeholder="Delete"], textarea[placeholder="Delete"]').first()
+        : null) ||
+      (await dialog.getByPlaceholder("Delete").first().isVisible().catch(() => false)
+        ? dialog.getByPlaceholder("Delete").first()
+        : null);
+
+    if (!confirmationInput) {
+      result.error = "Confirmation input was not found.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    await confirmationInput.fill("Delete", { timeout: 5000 }).catch(() => {});
+    const finalDeleteButton =
+      (await dialog.getByRole("button", { name: /^Delete$/i }).first().isVisible().catch(() => false)
+        ? dialog.getByRole("button", { name: /^Delete$/i }).first()
+        : null) ||
+      (await dialog.getByText(/^Delete$/i).first().isVisible().catch(() => false)
+        ? dialog.getByText(/^Delete$/i).first()
+        : null);
+
+    if (!finalDeleteButton) {
+      result.error = "Final Delete button was not found.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    await finalDeleteButton.click({ timeout: 5000 }).catch((error) => {
+      throw new Error(`Failed to click final Delete: ${error.message}`);
+    });
+    result.confirmationCompleted = true;
+
+    await page.waitForTimeout(DELETE_VERIFY_WAIT_MS);
+
+    const postRefresh = await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).then(async () => {
+      const freshFrame = await getVisibleWorkflowFrame(page, RETURN_ROOT_WAIT_MS);
+      const freshRows = await waitForCurrentScope(freshFrame, ROOT_SCOPE_WAIT_MS);
+      return { freshFrame, freshRows };
+    }).catch(() => null);
+
+    if (!postRefresh) {
+      result.error = "Unable to refresh after delete.";
+      result.runtimeMs = Date.now() - startedAt;
+      console.log(`${markerName}:${JSON.stringify(result)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const stillPresent = postRefresh.freshRows.some((row) =>
+      normalizeSignatureText(row.name || row.rowText) === normalizeSignatureText(result.resolvedRowName)
+    );
+
+    result.rowDisappeared = !stillPresent;
+    result.rowAbsentAfterRefresh = !stillPresent;
+    result.uiVerificationPassed = !stillPresent;
+    result.status = stillPresent ? "verification_failed" : "deleted";
+    if (stillPresent) {
+      result.error = `Target workflow still present after refresh: ${result.resolvedRowName}`;
+    }
+
     result.runtimeMs = Date.now() - startedAt;
-
-    console.log("[WORKFLOW-INVENTORY] inventory complete");
-    console.log(`WORKFLOW_INVENTORY_JSON:${JSON.stringify(result)}`);
+    console.log(`${markerName}:${JSON.stringify(result)}`);
   } catch (error) {
     result.runtimeMs = Date.now() - startedAt;
     result.error = String(error?.message || error);
-    console.log(`WORKFLOW_INVENTORY_JSON:${JSON.stringify(result)}`);
+    console.log(`${markerName}:${JSON.stringify(result)}`);
     process.exitCode = 1;
   } finally {
     await browser.close().catch(() => {});
   }
 }
 
-main().catch((error) => {
-  console.error(String(error?.stack || error?.message || error));
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(String(error?.stack || error?.message || error));
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  getWorkflowsUrl,
+  hasProtectedWorkflowName,
+  isRootFolderTarget,
+  parseDeleteJobsFromEnv,
+  resolveWorkflowRowIdentity,
+  selectSingleWorkflowJob,
+};
