@@ -9,9 +9,9 @@ const {
   verifyCustomValueFolderAssociation,
   toText,
 } = require("./customValuesImport");
+const { API_VERSION } = require("./ghlApiConfig");
 
 const BASE_URL = "https://services.leadconnectorhq.com";
-const VERSION = "2021-07-28";
 
 function createClient(token, clientFactory = axios.create) {
   return clientFactory({
@@ -21,7 +21,7 @@ function createClient(token, clientFactory = axios.create) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      Version: VERSION,
+      Version: API_VERSION,
     },
   });
 }

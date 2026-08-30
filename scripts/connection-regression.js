@@ -216,7 +216,7 @@ async function main() {
         []
       ),
     }),
-    "LOCATION_NOT_AUTHORIZED"
+    "LOCATION_ACCESS_FORBIDDEN"
   );
 
   const discoveredAgain = await discoverAccessibleLocations("header.payload.signature", {

@@ -46,12 +46,16 @@
         </div>
         <form id="connection-form">
           <div class="field">
-            <label for="integration-token">GHL Integration Token</label>
-            <small class="field-hint">Paste your GHL Private Integration Token here, not the Location ID.</small>
+            <label for="integration-token">GHL Private Integration Token</label>
+            <small class="field-hint">Paste your Private Integration Token. It stays server-side.</small>
             <div class="token-wrap">
               <input id="integration-token" type="password" autocomplete="off" required placeholder="Paste token">
               <button id="toggle-token" type="button" class="ghost">Show</button>
             </div>
+          </div>
+          <div class="field">
+            <label for="location-id">Location ID</label>
+            <input id="location-id" type="text" autocomplete="off" required placeholder="Enter GHL Location ID">
           </div>
           <button id="test-button" class="primary" type="submit">Connect account</button>
         </form>
@@ -61,15 +65,12 @@
             <strong id="account-name-inline">Not connected</strong>
           </div>
           <div>
-            <span>Selected Location</span>
-            <strong id="selected-location-inline">None</strong>
+            <span>Location</span>
+            <strong id="selected-location-inline">-</strong>
             <code id="selected-location-id-inline">-</code>
           </div>
         </div>
-        <div id="connection-locations" class="connection-locations hidden"></div>
         <div class="connection-actions">
-          <button id="refresh-locations" class="ghost" type="button" disabled>Refresh locations</button>
-          <button id="change-location" class="ghost" type="button" disabled>Change location</button>
           <button id="disconnect-button" class="danger-outline" type="button" disabled>Disconnect</button>
         </div>
         <div id="connection-result" class="message hidden"></div>
@@ -84,40 +85,6 @@
         <button id="scan-button" class="primary" type="button">Scan resources</button>
       </section>
 
-      <section id="custom-values" class="panel custom-values-panel">
-        <div class="panel-title">
-          <div>
-            <h2>Custom Values Setup</h2>
-            <p>Scan the current custom values, preview CSV/XLSX imports, and keep manual rows available when needed.</p>
-          </div>
-          <span class="step">02</span>
-        </div>
-        <form id="custom-values-form">
-          <div class="field custom-folder-field">
-            <label for="custom-value-folder-name">Target Folder</label>
-            <input id="custom-value-folder-name" autocomplete="off" placeholder="GHL Cleaner Test - CV Folder">
-          </div>
-          <div class="field custom-import-field">
-            <label for="custom-value-import-file">Upload CSV/XLSX</label>
-            <input id="custom-value-import-file" type="file" accept=".csv,.xlsx,.xls">
-          </div>
-          <div id="custom-value-rows" class="custom-value-rows"></div>
-          <button id="custom-value-add" class="ghost add-row" type="button">+ Add Custom Value</button>
-          <div class="custom-values-actions">
-            <button id="custom-value-preview" class="ghost" type="button">Preview import</button>
-            <button id="custom-value-confirm" class="primary" type="button" disabled>Confirm import</button>
-            <button id="custom-values-submit" class="primary" type="submit">Apply custom values</button>
-          </div>
-        </form>
-        <div class="custom-values-inventory-head">
-          <strong>Current Custom Values</strong>
-          <span>Visible from the active connection before import</span>
-        </div>
-        <div id="custom-values-inventory" class="custom-values-inventory hidden"></div>
-        <div id="custom-values-preview" class="custom-values-preview hidden"></div>
-        <div id="custom-values-result" class="message hidden"></div>
-      </section>
-
       <section id="inventory" class="hidden">
         <div class="metrics">
           <div><span>Total loaded</span><strong id="metric-total">0</strong></div>
@@ -129,7 +96,7 @@
           <div class="inventory-head">
             <div>
               <p class="kicker">RESOURCE INVENTORY</p>
-              <h2>Choose what to remove</h2>
+              <h2>Delete Items</h2>
             </div>
             <button id="rescan-button" class="ghost" type="button">Rescan</button>
           </div>
@@ -163,7 +130,7 @@
         <div>
           <p class="kicker danger-text">DANGER ZONE</p>
           <h2>Delete everything supported</h2>
-          <p>API items use the key. Workflows, Funnels, and Forms use separate browsers.</p>
+          <p>Only Tags, Custom Fields, Custom Values, and Trigger Links are supported.</p>
         </div>
         <button id="delete-all" class="danger-outline" type="button">Delete everything</button>
       </section>

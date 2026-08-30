@@ -8,6 +8,7 @@ const TOKEN = "regression-token";
 
 async function main() {
   const deleteCalls = [];
+  const readCalls = [];
   const originalCreate = axios.create;
 
   axios.create = () => ({
@@ -17,6 +18,12 @@ async function main() {
         status: 204,
         data: {},
       };
+    },
+    get: async (url) => {
+      readCalls.push(url);
+      const error = new Error("not found");
+      error.response = { status: 404 };
+      throw error;
     },
   });
 
@@ -94,14 +101,18 @@ async function main() {
       result.results.every((item) => item.status === "deleted"),
       "All API delete results should succeed."
     );
+    assert.strictEqual(readCalls.length, 4, "Every category should receive a fresh readback.");
+    assert.ok(result.results.every((item) => item.verificationStatus === "verified"), "Every delete should verify.");
 
     console.log(
       `API_DELETE_REGRESSION_JSON:${JSON.stringify({
         apiDeletionRegressionPassed: true,
         apiDeletionRegressionType: "new_regression_test",
         deleteCalls,
+        readCalls,
         deleted: result.deleted,
         failed: result.failed,
+        verificationFailed: result.verificationFailed,
       })}`
     );
   } finally {

@@ -1,20 +1,8 @@
 const axios = require("axios");
-
-const BASE_URL =
-  "https://services.leadconnectorhq.com";
+const { createGhlClient } = require("./ghlApiConfig");
 
 function createClient(token) {
-  return axios.create({
-    baseURL: BASE_URL,
-
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      Version: "2021-07-28",
-    },
-
-    timeout: 30000,
-  });
+  return createGhlClient(token, axios.create);
 }
 
 function extractArray(data, possibleKeys) {
@@ -254,6 +242,12 @@ async function deleteSelectedApiItems({
     }
   }
 
+  const verification = await verifyDeletedItems({
+    client,
+    locationId,
+    results,
+  });
+
   return {
     results,
 
@@ -266,12 +260,68 @@ async function deleteSelectedApiItems({
     failed:
       results.filter(
         (item) =>
-          item.status === "failed"
+          item.status === "failed" || item.status === "verification_failed"
       ).length,
+
+    verificationFailed: verification.verificationFailed,
   };
+}
+
+async function verifyDeletedItems({ client, locationId, results }) {
+  let verificationFailed = 0;
+  await Promise.all(results.filter((result) => result.id).map(async (result) => {
+    try {
+      await client.get(getDeletePath(result.category, locationId, result.id));
+      result.verificationStatus = "failed";
+      if (result.status === "deleted") result.status = "verification_failed";
+      result.verificationError = "Resource is still present after DELETE.";
+      result.error = result.error || result.verificationError;
+      verificationFailed += 1;
+    } catch (error) {
+      if (isResourceGoneError(error, result.category)) {
+        result.verificationStatus = "verified";
+      } else {
+        result.verificationStatus = "failed";
+        if (result.status === "deleted") result.status = "verification_failed";
+        result.verificationError = error.response?.data?.message || error.response?.data?.error || error.message;
+        result.error = result.error || result.verificationError;
+        verificationFailed += 1;
+      }
+    }
+  }));
+
+  return { verificationFailed };
+}
+
+function isResourceGoneError(error, category) {
+  const status = Number(error.response?.status || 0);
+  if (status === 404) return true;
+  if (status && (status === 401 || status === 403 || status === 429 || status >= 500)) return false;
+
+  const message = String(
+    error.response?.data?.message ||
+    error.response?.data?.error ||
+    error.message ||
+    ""
+  ).toLowerCase();
+  if (!message) return false;
+  if (/not found|does not exist|no such resource/.test(message)) return true;
+
+  const absencePatterns = {
+    tags: [/\btag\s+id\s+is\s+invalid\b/],
+    customFields: [
+      /\bcustom\s+field\s+id\s+is\s+invalid\b/,
+      /\bcustom\s+field\s+id\s+or\s+field[_\s-]*key\s+is\s+invalid\b/,
+    ],
+    customValues: [/\bcustom\s+value\s+id\s+is\s+invalid\b/],
+    triggerLinks: [/\btrigger\s+link\s+id\s+is\s+invalid\b/],
+  }[category] || [];
+  return absencePatterns.some((pattern) => pattern.test(message));
 }
 
 module.exports = {
   scanApiResources,
   deleteSelectedApiItems,
+  verifyDeletedItems,
+  isResourceGoneError,
 };

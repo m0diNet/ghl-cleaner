@@ -1,7 +1,12 @@
 const axios = require("axios");
+const { API_VERSION, BASE_URL } = require("./ghlApiConfig");
 
-const BASE_URL = "https://services.leadconnectorhq.com";
-const VERSION = "2021-07-28";
+function sanitizeMessage(value) {
+  return String(value || "")
+    .replace(/Bearer\s+[^\s,]+/gi, "Bearer [redacted]")
+    .replace(/\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted-token]")
+    .trim();
+}
 
 function createClient(token, clientFactory = axios.create) {
   return clientFactory({
@@ -10,7 +15,7 @@ function createClient(token, clientFactory = axios.create) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      Version: VERSION,
+      Version: API_VERSION,
     },
   });
 }
@@ -18,17 +23,22 @@ function createClient(token, clientFactory = axios.create) {
 function safeErrorMessage(error) {
   const data = error?.response?.data;
   if (typeof data === "string" && data.trim()) {
-    return data.trim();
+    return sanitizeMessage(data);
   }
 
   if (data && typeof data === "object") {
-    const message = String(data.message || data.error || data.details || "").trim();
+    const message = sanitizeMessage(data.message || data.error || data.details || "");
     if (message) {
       return message;
     }
   }
 
-  return String(error?.message || "Unknown GHL error").trim() || "Unknown GHL error";
+  return sanitizeMessage(error?.message || "Unknown GHL error") || "Unknown GHL error";
+}
+
+function safeErrorCode(error) {
+  const data = error?.response?.data;
+  return String(data?.code || data?.errorCode || data?.error_code || "").trim() || null;
 }
 
 function isLikelyPrivateIntegrationToken(token) {
@@ -48,7 +58,6 @@ function isLikelyPrivateIntegrationToken(token) {
 function classifyConnectionError(error, phase = "generic") {
   const status = Number(error?.response?.status || 0);
   const message = safeErrorMessage(error);
-  const normalized = message.toLowerCase();
 
   if (
     error?.code === "ECONNABORTED" ||
@@ -58,55 +67,75 @@ function classifyConnectionError(error, phase = "generic") {
     error?.code === "ETIMEDOUT"
   ) {
     return {
-      code: "NETWORK_ERROR",
+      code: "HIGHLEVEL_UNAVAILABLE",
       status,
-      message: "Could not reach GHL. Check the connection and try again.",
+      message: "Unable to reach HighLevel right now.",
       details: message,
+      ghlErrorCode: safeErrorCode(error),
     };
   }
 
-  if (
-    status === 401 ||
-    status === 422 ||
-    /invalid jwt|jwt malformed|invalid token|unauthorized|authentication failed|token is invalid/.test(normalized)
-  ) {
+  if (status === 401) {
     return {
-      code: "INVALID_TOKEN",
+      code: phase === "location" ? "AUTHENTICATION_FAILED" : "INVALID_TOKEN",
       status,
-      message: "That GHL token is invalid. Paste a valid Private Integration Token.",
+      message: phase === "location"
+        ? "Authentication failed. Check your Private Integration Token."
+        : "That GHL token is invalid. Paste a valid Private Integration Token.",
       details: message,
+      ghlErrorCode: safeErrorCode(error),
     };
   }
 
   if (status === 403) {
     return {
-      code: phase === "location" ? "LOCATION_NOT_AUTHORIZED" : "TOKEN_VALID_BUT_FORBIDDEN",
+      code: phase === "location" ? "LOCATION_ACCESS_FORBIDDEN" : "TOKEN_VALID_BUT_FORBIDDEN",
       status,
       message:
         phase === "location"
-          ? "This token does not have access to the selected GHL location."
+          ? "The token does not have permission to access this location."
           : "The token is valid, but it does not have the required permission to list locations.",
       details: message,
+      ghlErrorCode: safeErrorCode(error),
     };
   }
 
   if (status === 404 && phase === "location") {
     return {
-      code: "LOCATION_NOT_AUTHORIZED",
+      code: "LOCATION_NOT_FOUND_OR_INACCESSIBLE",
       status,
-      message: "This token does not have access to the selected GHL location.",
+      message: "Location not found or this token cannot access that Location ID.",
       details: message,
+      ghlErrorCode: safeErrorCode(error),
+    };
+  }
+
+  if (status === 429) {
+    return {
+      code: "RATE_LIMITED",
+      status,
+      message: "HighLevel rate limit reached. Try again shortly.",
+      details: message,
+      ghlErrorCode: safeErrorCode(error),
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      code: "HIGHLEVEL_UNAVAILABLE",
+      status,
+      message: "Unable to reach HighLevel right now.",
+      details: message,
+      ghlErrorCode: safeErrorCode(error),
     };
   }
 
   return {
-    code: "UNKNOWN_AUTH_ERROR",
+    code: "HIGHLEVEL_REQUEST_FAILED",
     status,
-    message:
-      phase === "location"
-        ? "This token does not have access to the selected GHL location."
-        : "GHL connection failed. Please try again.",
+    message: "HighLevel rejected the connection request.",
     details: message,
+    ghlErrorCode: safeErrorCode(error),
   };
 }
 

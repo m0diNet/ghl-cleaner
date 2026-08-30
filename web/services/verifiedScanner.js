@@ -4,19 +4,10 @@ const {
   buildCustomValueInventory,
   extractCustomValueItems,
 } = require("./customValuesImport");
+const { createGhlClient } = require("./ghlApiConfig");
 
-const BASE_URL = "https://services.leadconnectorhq.com";
-
-function createClient(token, version) {
-  return axios.create({
-    baseURL: BASE_URL,
-    timeout: 60000,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      Version: version,
-    },
-  });
+function createClient(token) {
+  return createGhlClient(token, axios.create);
 }
 
 function firstArray(data, paths) {
@@ -128,8 +119,8 @@ function makeResult({ category, raw, data, totalPaths = [], locationId }) {
   };
 }
 
-async function requestList({ token, version, endpoint, params, category, arrayPaths, totalPaths = [], locationId = "" }) {
-  const response = await createClient(token, version).get(endpoint, { params });
+async function requestList({ token, endpoint, params, category, arrayPaths, totalPaths = [], locationId = "" }) {
+  const response = await createClient(token).get(endpoint, { params });
   const raw = firstArray(response.data, arrayPaths);
   return makeResult({ category, raw, data: response.data, totalPaths, locationId });
 }
@@ -139,7 +130,6 @@ async function scanTags(values) {
     ...values,
     category: "tags",
     endpoint: `/locations/${values.locationId}/tags`,
-    version: "2021-07-28",
     params: undefined,
     arrayPaths: ["tags", "data.tags"],
     totalPaths: ["total", "count", "meta.total"],
@@ -152,7 +142,6 @@ async function scanCustomFields(values) {
     ...values,
     category: "customFields",
     endpoint: `/locations/${values.locationId}/customFields`,
-    version: "2021-07-28",
     params: { model: "all" },
     arrayPaths: ["customFields", "fields", "data.customFields", "data.fields"],
     totalPaths: ["total", "count", "meta.total"],
@@ -161,7 +150,7 @@ async function scanCustomFields(values) {
 }
 
 async function scanCustomValues(values) {
-  const client = createClient(values.token, "2021-07-28");
+  const client = createClient(values.token);
   const response = await client.get(`/locations/${values.locationId}/customValues`);
   const raw = extractCustomValueItems(response.data);
   const inventory = buildCustomValueInventory(raw);
@@ -201,103 +190,11 @@ async function scanTriggerLinks(values) {
     ...values,
     category: "triggerLinks",
     endpoint: "/links/",
-    version: "2021-07-28",
     params: { locationId: values.locationId },
     arrayPaths: ["links", "triggerLinks", "data.links", "data.triggerLinks", "data"],
     totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
     locationId: values.locationId,
   });
-}
-
-async function scanWorkflows(values) {
-  return requestList({
-    ...values,
-    category: "workflows",
-    endpoint: "/workflows/",
-    version: "2021-04-15",
-    params: { locationId: values.locationId },
-    arrayPaths: ["workflows", "data.workflows", "data"],
-    totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
-    locationId: values.locationId,
-  });
-}
-
-async function scanFunnels(values) {
-  return requestList({
-    ...values,
-    category: "funnels",
-    endpoint: "/funnels/funnel/list",
-    version: "2021-07-28",
-    params: { locationId: values.locationId },
-    arrayPaths: ["funnels", "data.funnels", "data"],
-    totalPaths: ["total", "count", "meta.total", "data.total", "data.count"],
-    locationId: values.locationId,
-  });
-}
-
-async function scanForms(values) {
-  const client = createClient(values.token, "2021-07-28");
-  const limit = 100;
-  const raw = [];
-  let skip = 0;
-  let reportedTotal = null;
-  let lastData = null;
-  const seenPageSignatures = new Set();
-
-  for (let page = 0; page < 100; page += 1) {
-    const response = await client.get("/forms/", {
-      params: {
-        locationId: values.locationId,
-        limit,
-        skip,
-      },
-    });
-
-    lastData = response.data;
-    const batch = firstArray(response.data, ["forms", "data.forms", "data"]);
-    const pageTotal = firstNumber(response.data, [
-      "total",
-      "count",
-      "meta.total",
-      "data.total",
-      "data.count",
-    ]);
-
-    if (pageTotal !== null) reportedTotal = pageTotal;
-
-    const signature = batch.map((item) => String(itemId(item) || "")).join("|");
-    if (seenPageSignatures.has(signature)) break;
-    seenPageSignatures.add(signature);
-
-    raw.push(...batch);
-
-    if (!batch.length) break;
-    if (reportedTotal !== null && raw.length >= reportedTotal) break;
-    if (batch.length < limit) break;
-
-    skip += batch.length;
-  }
-
-  const result = makeResult({
-    category: "forms",
-    raw,
-    data: lastData || {},
-    totalPaths: [],
-    locationId: values.locationId,
-  });
-
-  result.reportedTotal = reportedTotal ?? result.loadedCount;
-  result.count = result.loadedCount;
-  result.verified =
-    result.missingIds === 0 &&
-    result.duplicateIds === 0 &&
-    result.loadedCount === result.reportedTotal;
-  result.status = result.verified ? "verified" : "incomplete";
-  result.error = result.verified
-    ? null
-    : `loaded ${result.loadedCount} of ${result.reportedTotal}`;
-
-  return result;
 }
 
 function failed(category, error) {
@@ -321,9 +218,6 @@ async function scanVerifiedResources(values) {
     customFields: scanCustomFields,
     customValues: scanCustomValues,
     triggerLinks: scanTriggerLinks,
-    workflows: scanWorkflows,
-    funnels: scanFunnels,
-    forms: scanForms,
   };
 
   const entries = await Promise.all(
@@ -345,7 +239,4 @@ module.exports = {
   scanCustomFields,
   scanCustomValues,
   scanTriggerLinks,
-  scanWorkflows,
-  scanFunnels,
-  scanForms,
 };
