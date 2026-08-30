@@ -1,5 +1,6 @@
 require("dotenv").config({ quiet: true });
 
+const path = require("path");
 const { closeBrowserlessSession, formatBrowserlessError, saveBrowserlessStorageState } = require("../services/browserless");
 const {
   buildCustomValueInventory,
@@ -15,6 +16,7 @@ const {
   ensureFolder,
   openCustomValuesPage,
   openSessionWithLocalFallback,
+  moveCustomValueToFolder,
   verifyCustomValuesPage,
 } = require("./ensure-custom-values");
 
@@ -51,29 +53,62 @@ function decodeFileData(payload) {
 }
 
 function parseRowsFromPayload(payload) {
+  const file = decodeFileData(payload);
+  if (file.buffer || file.text) {
+    if (file.kind === "xlsx") {
+      return parseWorkbookBuffer(file.buffer);
+    }
+    return parseDelimitedText(file.text);
+  }
+
   if (Array.isArray(payload.rows)) {
     return payload.rows;
   }
 
-  const file = decodeFileData(payload);
-  if (file.kind === "xlsx") {
-    return parseWorkbookBuffer(file.buffer);
-  }
+  return [];
+}
 
-  return parseDelimitedText(file.text);
+async function loadCustomValueInventory(locationId, token, { clientFactory } = {}) {
+  try {
+    return await listCustomValues(locationId, token, { clientFactory });
+  } catch (error) {
+    const wrapped = new Error("API inventory failed.");
+    wrapped.code = "API_INVENTORY_FAILED";
+    wrapped.details = error?.message || String(error);
+    wrapped.cause = error;
+    throw wrapped;
+  }
+}
+
+async function buildImportPreview({ locationId, token, rows, targetFolderName, fileMode, clientFactory } = {}) {
+  const inventory = await loadCustomValueInventory(locationId, token, { clientFactory });
+  const classification = classifyCustomValueRows(
+    rows,
+    inventory.items,
+    fileMode ? "" : targetFolderName,
+    { fileMode }
+  );
+
+  return {
+    inventory,
+    classification,
+  };
 }
 
 async function main() {
   const startedAt = Date.now();
   const payload = parseImportPayload();
+  let session = null;
   const result = {
     success: false,
     mode: toText(payload.mode || "execute") || "execute",
     locationId: toText(payload.locationId || ""),
     targetFolderName: toText(payload.targetFolderName || payload.folderName || ""),
+    fileMode: Boolean(payload.fileName || payload.fileType || payload.fileText || payload.fileBase64),
     inventoryLoaded: false,
     folderCreated: false,
     folderExisting: false,
+    folderStatus: "existing",
     folderAssociationVerified: false,
     folderId: "",
     preview: [],
@@ -105,37 +140,32 @@ async function main() {
   const rows = parseRowsFromPayload(payload).map((row) => ({
     name: row.name ?? row.Name ?? row["Custom Value Name"] ?? row.key ?? "",
     value: row.value ?? row.Value ?? "",
+    folderId: row.folderId ?? row["Folder ID"] ?? row.parentId ?? "",
     folderName: row.folderName ?? row.folder ?? row["Folder Name"] ?? row["Target Folder"] ?? "",
   }));
 
-  const session = await openSessionWithLocalFallback();
+  if (result.fileMode) {
+    result.targetFolderName = "";
+  }
+
+  const token = toText(payload.token || "");
+  if (!token) {
+    result.error = "Missing session token.";
+    result.runtimeMs = Date.now() - startedAt;
+    console.log(`CUSTOM_VALUES_IMPORT_RESULT_JSON:${JSON.stringify(result)}`);
+    process.exitCode = 1;
+    return;
+  }
+
   try {
-    const context = session.context;
-    const page = session.page || context.pages()[0] || (await context.newPage());
-    page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(90000);
-
-    await openCustomValuesPage(page, result.locationId);
-    const ready = await verifyCustomValuesPage(page);
-    result.scopeUrl = ready.scopeUrl;
-    result.pageReady = true;
-
-    const token = toText(payload.token || "");
-    if (!token) {
-      throw new Error("Missing session token.");
-    }
-
-    const inventory = await listCustomValues(result.locationId, token);
-    result.inventoryLoaded = true;
-    const existingFolder = findCustomValueFolder(inventory, result.targetFolderName);
-    result.folderExisting = Boolean(existingFolder);
-    result.folderId = existingFolder?.folderId || "";
-    const classification = classifyCustomValueRows(
+    const { inventory, classification } = await buildImportPreview({
+      locationId: result.locationId,
+      token,
       rows,
-      inventory.items,
-      result.targetFolderName
-    );
-
+      targetFolderName: result.targetFolderName,
+      fileMode: result.fileMode,
+    });
+    result.inventoryLoaded = true;
     result.preview = classification.rows;
     result.counts = classification.counts;
 
@@ -146,17 +176,67 @@ async function main() {
       return;
     }
 
-    if (result.targetFolderName) {
-      const folderResult = await ensureFolder(page, result.targetFolderName);
-      result.folderCreated = folderResult.status === "created";
-      result.folderExisting = result.folderExisting || folderResult.status === "existing";
-      if (folderResult.status === "failed") {
-        result.verificationFailures.push(folderResult.error || "Folder creation failed.");
+    const browserRows = classification.rows.filter(
+      (row) => (row.action === "CREATE" || row.action === "UPDATE") &&
+        row.targetFolder && row.folderStatus !== "EXISTING"
+    );
+    const folderNames = [...new Set(
+      browserRows
+        .map((row) => toText(row.targetFolder || ""))
+        .filter(Boolean)
+    )];
+    const browserVerifiedRows = new Map();
+    const rowStatuses = new Map();
+
+    let page = null;
+    if (browserRows.length) {
+      session = await openSessionWithLocalFallback();
+      const context = session.context;
+      page = session.page || context.pages()[0] || (await context.newPage());
+      page.setDefaultTimeout(30000);
+      page.setDefaultNavigationTimeout(90000);
+
+      result.pageReady = false;
+      try {
+        await openCustomValuesPage(page, result.locationId);
+        const ready = await verifyCustomValuesPage(page);
+        result.scopeUrl = ready.scopeUrl;
+        result.pageReady = true;
+      } catch (browserError) {
+        const message = formatBrowserlessError(browserError);
+        const lower = String(message || "").toLowerCase();
+        if (lower.includes("browserless remote browser is unavailable")) {
+          throw Object.assign(new Error("Browserless unavailable."), {
+            code: "BROWSERLESS_UNAVAILABLE",
+            details: message,
+            cause: browserError,
+          });
+        }
+        throw Object.assign(new Error("Local browser failed."), {
+          code: "LOCAL_BROWSER_FAILED",
+          details: message,
+          cause: browserError,
+        });
+      }
+
+      for (const folderName of folderNames) {
+        const folderResult = await ensureFolder(page, folderName);
+        result.folderCreated = result.folderCreated || folderResult.status === "created";
+        result.folderExisting = result.folderExisting || folderResult.status === "existing";
+        if (folderResult.status === "failed") {
+          result.folderStatus = "failed";
+        } else if (folderResult.status === "created" && result.folderStatus !== "failed") {
+          result.folderStatus = "created";
+        }
+        if (folderResult.status === "failed") {
+          result.verificationFailures.push(folderResult.error || `Folder creation failed for "${folderName}".`);
+        }
       }
     }
 
     for (const previewRow of classification.rows) {
       if (previewRow.action === "INVALID" || previewRow.action === "CONFLICT" || previewRow.action === "UNCHANGED") {
+        rowStatuses.set(previewRow.name, previewRow.action);
         if (previewRow.action === "UNCHANGED") {
           result.unchanged += 1;
           result.skipped += 1;
@@ -171,20 +251,36 @@ async function main() {
         const write = await ensureCustomValue(result.locationId, token, {
           name: previewRow.name,
           value: previewRow.importedValue,
-          folderName: previewRow.targetFolder || result.targetFolderName || "",
-          folderId: result.folderId || previewRow.targetFolderId || "",
+          folderName: previewRow.targetFolder || "",
+          folderId: previewRow.targetFolderId || "",
+        }, {
+          associateFolder: async ({ item }) => {
+            if (!previewRow.targetFolder) {
+              return { moved: false, skipped: true };
+            }
+            const existingFolder = toText(previewRow.existingFolder || "");
+            const targetFolder = toText(previewRow.targetFolder || "");
+            if (previewRow.folderStatus === "EXISTING" ||
+              (existingFolder && targetFolder && existingFolder.toLowerCase() === targetFolder.toLowerCase())) {
+              return { moved: false, skipped: true };
+            }
+            if (!page) {
+              throw new Error(`Browser verification is required to associate "${previewRow.name}" with a folder.`);
+            }
+            return moveCustomValueToFolder(
+              page,
+              item?.name || previewRow.name,
+              targetFolder,
+              item?.id || ""
+            );
+          },
         });
+        rowStatuses.set(previewRow.name, write.status);
 
         if (write.status === "created") {
           result.created += 1;
-          if (write.folder?.folderId && !result.folderId) {
-            result.folderId = write.folder.folderId;
-          }
         } else if (write.status === "updated") {
           result.updated += 1;
-          if (write.folder?.folderId && !result.folderId) {
-            result.folderId = write.folder.folderId;
-          }
         } else if (write.status === "unchanged") {
           result.unchanged += 1;
           result.skipped += 1;
@@ -192,12 +288,9 @@ async function main() {
           result.failed += 1;
           result.verificationFailures.push(`Write failed: ${previewRow.name}`);
         }
-
-        if (write.folderVerified === false) {
-          result.failed += 1;
-          result.verificationFailures.push(`Association not proven for ${previewRow.name}`);
-        }
+        browserVerifiedRows.set(previewRow.name, write.folderVerified === true);
       } catch (error) {
+        rowStatuses.set(previewRow.name, "FAILED");
         result.failed += 1;
         result.verificationFailures.push(`${previewRow.name}: ${error.message}`);
       }
@@ -205,54 +298,70 @@ async function main() {
 
     const refreshed = await listCustomValues(result.locationId, token);
     const refreshedInventory = buildCustomValueInventory(refreshed.items);
-    const folderNameTarget = toText(result.targetFolderName);
-    const folderAssociation = verifyCustomValueFolderAssociation(
-      refreshedInventory,
-      folderNameTarget,
-      result.folderId
-    );
-    const verifiedRows = classification.rows.filter((row) => row.action !== "INVALID" && row.action !== "CONFLICT");
+    const verifiedRows = classification.rows.filter((row) => {
+      const status = rowStatuses.get(row.name);
+      return status === "created" || status === "updated" || status === "unchanged";
+    });
 
-    result.folderAssociationVerified = folderAssociation.verified;
-    if (!folderAssociation.verified) {
-      result.verificationFailures.push(...folderAssociation.failures);
-    }
+    let folderAssociationVerified = true;
 
-    const affected = verifiedRows.every((row) => {
+    for (const row of verifiedRows) {
       const match = refreshedInventory.items.find(
         (item) => String(item.name || "").toLowerCase() === String(row.name || "").toLowerCase()
       );
       if (!match) {
+        folderAssociationVerified = false;
+        result.failed += 1;
         result.verificationFailures.push(`Missing after write: ${row.name}`);
-        return false;
+        continue;
       }
-      if (!folderNameTarget) {
-        return true;
-      }
-      return String(match.folderName || "").trim().toLowerCase() === folderNameTarget.trim().toLowerCase();
-    });
 
-    result.success = result.failed === 0 && result.verificationFailures.length === 0 && affected && result.folderAssociationVerified;
+      const expectedValue = String(row.importedValue || "");
+      if (String(match.value || "") !== expectedValue) {
+        folderAssociationVerified = false;
+        result.failed += 1;
+        result.verificationFailures.push(`Value mismatch after write: ${row.name}`);
+        continue;
+      }
+
+      const expectedFolder = toText(row.targetFolder || "");
+      if (!expectedFolder) {
+        continue;
+      }
+
+      const browserVerified = browserVerifiedRows.get(row.name) === true;
+      const folderMatches =
+        (row.targetFolderId && String(match.folderId || "").trim() === String(row.targetFolderId).trim()) ||
+        String(match.folderName || "").trim().toLowerCase() === expectedFolder.trim().toLowerCase();
+      if (!browserVerified && !folderMatches) {
+        folderAssociationVerified = false;
+        result.failed += 1;
+        result.verificationFailures.push(`Folder mismatch after write: ${row.name}`);
+      }
+    }
+
+    result.folderAssociationVerified = folderAssociationVerified;
+    result.success = result.failed === 0 && result.verificationFailures.length === 0 && result.folderAssociationVerified;
     result.runtimeMs = Date.now() - startedAt;
     console.log(`CUSTOM_VALUES_IMPORT_RESULT_JSON:${JSON.stringify(result)}`);
   } catch (error) {
-    result.error = formatBrowserlessError(error);
+    result.error = error.code || error.message || formatBrowserlessError(error);
     result.runtimeMs = Date.now() - startedAt;
     console.log(`CUSTOM_VALUES_IMPORT_RESULT_JSON:${JSON.stringify(result)}`);
     process.exitCode = 1;
   } finally {
-    await saveBrowserlessStorageState(
-      session.context,
-      String(
-        process.env.BROWSER_STORAGE_STATE_PATH ||
-          path.join(__dirname, "..", "browser-state", "ghl-storage-state.json")
-      ).trim()
-    ).catch(() => {});
-    await closeBrowserlessSession(session).catch(() => {});
+    if (session) {
+      await saveBrowserlessStorageState(
+        session.context,
+        String(
+          process.env.BROWSER_STORAGE_STATE_PATH ||
+            path.join(__dirname, "..", "browser-state", "ghl-storage-state.json")
+        ).trim()
+      ).catch(() => {});
+      await closeBrowserlessSession(session).catch(() => {});
+    }
   }
 }
-
-const path = require("path");
 
 if (require.main === module) {
   main().catch((error) => {
@@ -263,6 +372,7 @@ if (require.main === module) {
 
 module.exports = {
   decodeFileData,
+  buildImportPreview,
   parseImportPayload,
   parseRowsFromPayload,
 };

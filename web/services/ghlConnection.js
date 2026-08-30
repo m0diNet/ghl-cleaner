@@ -1,16 +1,16 @@
 const axios = require("axios");
+const https = require("https");
+const { buildGhlHeaders } = require("./ghlApiConfig");
 
 const BASE_URL = "https://services.leadconnectorhq.com";
-const VERSION = "2021-07-28";
 
 function createClient(token, clientFactory = axios.create) {
   return clientFactory({
     baseURL: BASE_URL,
     timeout: 30000,
+    httpsAgent: new https.Agent({ rejectUnauthorized: false }),
     headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      Version: VERSION,
+      ...buildGhlHeaders(token),
     },
   });
 }
@@ -31,18 +31,59 @@ function safeErrorMessage(error) {
   return String(error?.message || "Unknown GHL error").trim() || "Unknown GHL error";
 }
 
+function sanitizeDiagnosticData(data, depth = 0) {
+  if (data === null || data === undefined) {
+    return data;
+  }
+
+  if (typeof data === "string") {
+    return data.length > 2000 ? `${data.slice(0, 2000)}…` : data;
+  }
+
+  if (typeof data === "number" || typeof data === "boolean") {
+    return data;
+  }
+
+  if (Array.isArray(data)) {
+    return data.slice(0, 20).map((item) => sanitizeDiagnosticData(item, depth + 1));
+  }
+
+  if (typeof data !== "object" || depth > 3) {
+    return String(data);
+  }
+
+  const redactedKeys = /token|authorization|secret|password|cookie|session/i;
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => [
+      key,
+      redactedKeys.test(key) ? "[redacted]" : sanitizeDiagnosticData(value, depth + 1),
+    ])
+  );
+}
+
+function logGhlConnectionDiagnostic(error, method, pathname) {
+  const status = Number(error?.response?.status || 0) || "NONE";
+  const code = error?.code || "NONE";
+  const message = safeErrorMessage(error);
+  const data = sanitizeDiagnosticData(error?.response?.data);
+  console.error("GHL_CONNECTION_DIAGNOSTIC");
+  console.error(`status: ${status}`);
+  console.error(`code: ${code}`);
+  console.error(`message: ${message}`);
+  console.error(`method: ${String(method || "GET").toUpperCase()}`);
+  console.error(`path: ${pathname}`);
+  if (data !== undefined) {
+    console.error(`data: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+  }
+}
+
 function isLikelyPrivateIntegrationToken(token) {
   const value = String(token || "").trim();
   if (!value || value.includes(" ")) {
     return false;
   }
 
-  const parts = value.split(".");
-  if (parts.length !== 3) {
-    return false;
-  }
-
-  return parts.every((part) => Boolean(part.trim()));
+  return value.toLowerCase().startsWith("pit-") && value.length > 8;
 }
 
 function classifyConnectionError(error, phase = "generic") {
@@ -65,11 +106,36 @@ function classifyConnectionError(error, phase = "generic") {
     };
   }
 
+  if (status === 429) {
+    return {
+      code: "GHL_RATE_LIMIT",
+      status,
+      message: "GHL rate limit reached. Please retry in a moment.",
+      details: message,
+    };
+  }
+
   if (
     status === 401 ||
     status === 422 ||
     /invalid jwt|jwt malformed|invalid token|unauthorized|authentication failed|token is invalid/.test(normalized)
   ) {
+    if (phase === "location" && status === 422) {
+      return {
+        code: "INVALID_LOCATION",
+        status,
+        message: "That Location ID could not be verified for this token.",
+        details: message,
+      };
+    }
+    if (phase === "location" && status === 422) {
+      return {
+        code: "INVALID_LOCATION_OR_REQUEST",
+        status,
+        message: "That Location ID could not be verified for this token.",
+        details: message,
+      };
+    }
     return {
       code: "INVALID_TOKEN",
       status,
@@ -79,11 +145,18 @@ function classifyConnectionError(error, phase = "generic") {
   }
 
   if (status === 403) {
+    const missingScope = /scope|permission|forbidden|not allowed|not authorized/.test(normalized);
     return {
-      code: phase === "location" ? "LOCATION_NOT_AUTHORIZED" : "TOKEN_VALID_BUT_FORBIDDEN",
+      code: missingScope
+        ? "MISSING_SCOPE"
+        : phase === "location"
+          ? "TOKEN_FORBIDDEN_FOR_LOCATION"
+          : "TOKEN_VALID_BUT_FORBIDDEN",
       status,
       message:
-        phase === "location"
+        missingScope
+          ? "The token is missing a required scope for this request."
+          : phase === "location"
           ? "This token does not have access to the selected GHL location."
           : "The token is valid, but it does not have the required permission to list locations.",
       details: message,
@@ -92,19 +165,28 @@ function classifyConnectionError(error, phase = "generic") {
 
   if (status === 404 && phase === "location") {
     return {
-      code: "LOCATION_NOT_AUTHORIZED",
+      code: "LOCATION_NOT_FOUND",
       status,
-      message: "This token does not have access to the selected GHL location.",
+      message: "That Location ID could not be verified for this token.",
+      details: message,
+    };
+  }
+
+  if (phase === "location" && status === 400) {
+    return {
+      code: "INVALID_LOCATION",
+      status,
+      message: "That Location ID could not be verified for this token.",
       details: message,
     };
   }
 
   return {
-    code: "UNKNOWN_AUTH_ERROR",
+    code: "GHL_API_ERROR",
     status,
     message:
       phase === "location"
-        ? "This token does not have access to the selected GHL location."
+        ? "That Location ID could not be verified for this token."
         : "GHL connection failed. Please try again.",
     details: message,
   };
@@ -237,6 +319,14 @@ async function validateLocationAccess(token, locationId, { clientFactory = axios
   const client = createClient(token, clientFactory);
   const safeLocationId = String(locationId || "").trim();
 
+  if (!safeLocationId || safeLocationId.includes(" ")) {
+    const err = new Error("Invalid Location ID.");
+    err.code = "INVALID_LOCATION_ID";
+    err.status = 400;
+    err.details = "A valid location id is required.";
+    throw err;
+  }
+
   try {
     const response = await client.get(`/locations/${encodeURIComponent(safeLocationId)}`);
     const location = response.data?.location || response.data || {};
@@ -248,6 +338,7 @@ async function validateLocationAccess(token, locationId, { clientFactory = axios
 
     return normalized;
   } catch (error) {
+    logGhlConnectionDiagnostic(error, "GET", `/locations/${encodeURIComponent(safeLocationId)}`);
     const classified = classifyConnectionError(error, "location");
     const err = new Error(classified.message);
     err.code = classified.code;
@@ -258,7 +349,26 @@ async function validateLocationAccess(token, locationId, { clientFactory = axios
   }
 }
 
-async function validateConnection(token, { clientFactory = axios.create } = {}) {
+async function validateConnectionForLocation(token, locationId, { clientFactory = axios.create } = {}) {
+  if (!isLikelyPrivateIntegrationToken(token)) {
+    const err = new Error("That GHL token is invalid. Paste a valid Private Integration Token.");
+    err.code = "INVALID_TOKEN";
+    err.status = 400;
+    err.details = "Malformed token.";
+    throw err;
+  }
+
+  const validatedLocation = await validateLocationAccess(token, locationId, { clientFactory });
+  return {
+    accountName: validatedLocation.companyName || validatedLocation.name || "Connected GHL Account",
+    companyName: validatedLocation.companyName || "",
+    locations: [validatedLocation],
+    selectedLocation: validatedLocation,
+    selectedLocationId: validatedLocation.id || String(locationId || "").trim(),
+  };
+}
+
+async function validateConnection(token, { clientFactory = axios.create, allowNoAccessibleLocations = false } = {}) {
   if (!isLikelyPrivateIntegrationToken(token)) {
     const err = new Error("That GHL token is invalid. Paste a valid Private Integration Token.");
     err.code = "INVALID_TOKEN";
@@ -293,7 +403,22 @@ async function validateConnection(token, { clientFactory = axios.create } = {}) 
             ? "That GHL token is invalid. Paste a valid Private Integration Token."
             : code === "NETWORK_ERROR"
               ? "Could not reach GHL. Check the connection and try again."
-              : "This token did not return any accessible GHL locations.";
+            : "This token did not return any accessible GHL locations.";
+
+    if (allowNoAccessibleLocations) {
+      return {
+        accountName: "Connected GHL Account",
+        companyName: "",
+        locations: [],
+        source: discovery.source,
+        probe: probe?.ok ? probe.raw : null,
+        warning: {
+          code,
+          message,
+          details: discoveryError?.details || probe?.error?.details || "No accessible locations were returned.",
+        },
+      };
+    }
 
     const err = new Error(message);
     err.code = code;
@@ -320,6 +445,7 @@ module.exports = {
   isLikelyPrivateIntegrationToken,
   normalizeLocation,
   probeToken,
+  validateConnectionForLocation,
   validateConnection,
   validateLocationAccess,
 };

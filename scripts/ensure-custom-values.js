@@ -60,6 +60,10 @@ function normalize(value) {
     .toLowerCase();
 }
 
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 async function isVisible(locator) {
   return locator.isVisible().catch(() => false);
 }
@@ -331,7 +335,7 @@ async function openSessionWithLocalFallback() {
   try {
     browserlessSession = await connectBrowserless({
       logger: (line) => console.log(`[CUSTOM VALUES] ${line}`),
-      timeoutMs: 45000,
+      timeoutMs: 12000,
     });
 
     const context = browserlessSession.context;
@@ -350,7 +354,7 @@ async function openSessionWithLocalFallback() {
     const verification = await verifyGhlAuthenticatedPage(
       authPage,
       LOCATION_ID,
-      45000
+      12000
     );
     await authPage.close().catch(() => {});
 
@@ -480,33 +484,194 @@ async function chooseFolder(page, folderName) {
     return false;
   }
 
-  const candidates = [
-    page.getByLabel(/folder/i),
-    page.getByRole("combobox", { name: /folder/i }),
-    page.locator('input[placeholder*="folder" i]').first(),
-    page.locator('input[name*="folder" i]').first(),
-  ];
-
-  for (const candidate of candidates) {
-    if (!(await isVisible(candidate))) {
-      continue;
-    }
-
-    await candidate.click({ force: true }).catch(() => {});
-    await candidate.fill(folderName).catch(async () => {
-      await candidate.press("Control+A").catch(() => {});
-      await candidate.type(folderName, { delay: 10 }).catch(() => {});
-    });
-    await candidate.press("Enter").catch(() => {});
-    return true;
+  const select = page.locator("#move-to-folder-select .hr-base-selection-label").first();
+  if (!(await isVisible(select))) {
+    return false;
   }
 
-  return false;
+  await select.click({ force: true });
+  const escaped = escapeRegExp(folderName);
+  const options = page.getByText(new RegExp(`^\\s*${escaped}\\s*$`, "i"));
+  const visibleOptions = [];
+  for (let index = 0; index < await options.count(); index += 1) {
+    const option = options.nth(index);
+    if (await isVisible(option)) {
+      visibleOptions.push(option);
+    }
+  }
+
+  if (visibleOptions.length !== 1) {
+    throw new Error(`Expected exactly one visible folder option named "${folderName}", found ${visibleOptions.length}.`);
+  }
+
+  await visibleOptions[0].click({ force: true });
+  return true;
+}
+
+async function locateCustomValueRow(page, itemName, itemId = "") {
+  if (itemId) {
+    const idRow = page.locator(`tr[data-id="${String(itemId).replace(/["\\]/g, "\\$&")}"]`).first();
+    if (await isVisible(idRow)) {
+      return idRow;
+    }
+  }
+
+  const escaped = escapeRegExp(itemName);
+  const exactText = page.getByText(new RegExp(`^\\s*${escaped}\\s*$`, "i"));
+  const rows = [];
+  for (let index = 0; index < await exactText.count(); index += 1) {
+    const row = exactText.nth(index).locator("xpath=ancestor::tr[1]");
+    if (await isVisible(row)) {
+      rows.push(row);
+    }
+  }
+
+  if (rows.length === 1) {
+    return rows[0];
+  }
+
+  return null;
+}
+
+async function refreshCustomValuesPage(page) {
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 90000 });
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await verifyCustomValuesPage(page);
+}
+
+async function openCustomValueActions(page, itemName, itemId = "") {
+  const row = await locateCustomValueRow(page, itemName, itemId);
+  if (!row) {
+    throw new Error(`Unable to find custom value row for "${itemName}".`);
+  }
+
+  const candidates = [
+    row.locator("td").last().locator("svg").last(),
+  ];
+
+  const button = await firstVisible(candidates);
+  if (!button) {
+    throw new Error(`Unable to find actions control for "${itemName}".`);
+  }
+
+  await button.click({ force: true });
+  return row;
+}
+
+async function openFolderAndVerifyCustomValue(page, folderName, itemName, itemId = "") {
+  await clickByText(page, [/^folders$/i]).catch(() => {});
+  await page.waitForTimeout(500);
+
+  const folderPattern = new RegExp(`^\\s*${escapeRegExp(folderName)}\\s*$`, "i");
+  const folderNames = page.getByText(folderPattern);
+  const visibleFolderNames = [];
+  for (let index = 0; index < await folderNames.count(); index += 1) {
+    const folderNameLocator = folderNames.nth(index);
+    if (await isVisible(folderNameLocator)) {
+      visibleFolderNames.push(folderNameLocator);
+    }
+  }
+
+  if (visibleFolderNames.length !== 1) {
+    throw new Error(`Expected exactly one visible folder named "${folderName}", found ${visibleFolderNames.length}.`);
+  }
+
+  const folderUrlBefore = page.url();
+  await visibleFolderNames[0].click({ force: true });
+  await page.waitForURL(
+    (url) => url.toString() !== folderUrlBefore && url.searchParams.has("parentId"),
+    { timeout: 10000 }
+  );
+  await page.waitForTimeout(700);
+  const body = await currentBodyText(page);
+  const folderViewMarker = normalize(`Showing all custom values inside the ${folderName} folder.`);
+  if (!page.url().includes("parentId=") || !body.includes(folderViewMarker)) {
+    throw new Error(`Folder "${folderName}" did not open its dedicated contents view.`);
+  }
+  const row = await locateCustomValueRow(page, itemName, itemId);
+  if (!row) {
+    throw new Error(`Custom value "${itemName}" was not found inside folder "${folderName}".`);
+  }
+  return true;
+}
+
+async function moveCustomValueToFolder(page, itemName, folderName, itemId = "") {
+  if (!folderName) {
+    return { moved: false, skipped: true };
+  }
+
+  const debug = {
+    exactValueFound: false,
+    actionMenuOpened: false,
+    moveToFolderClicked: false,
+    folderPickerOpened: false,
+    exactFolderFound: false,
+    folderSelected: false,
+    confirmationClicked: false,
+    refreshCompleted: false,
+    valueFoundInsideFolder: false,
+  };
+
+  try {
+    await refreshCustomValuesPage(page);
+    debug.refreshCompleted = true;
+    await clickByText(page, [/^all values$/i]).catch(() => {});
+    await page.waitForTimeout(500);
+
+    const row = await locateCustomValueRow(page, itemName, itemId);
+    debug.exactValueFound = Boolean(row);
+    if (!row) {
+      throw new Error(`Unable to find exact Custom Value row for "${itemName}".`);
+    }
+
+    await openCustomValueActions(page, itemName, itemId);
+    debug.actionMenuOpened = true;
+
+    const moveButton = page.getByText(/^Move to folder$/i).last();
+    if (!(await isVisible(moveButton))) {
+      throw new Error(`Unable to find exact Move To Folder control for "${itemName}".`);
+    }
+    await moveButton.click({ force: true });
+    debug.moveToFolderClicked = true;
+
+    const dialog = page.locator("#move-to-folder-modal").first();
+    await dialog.waitFor({ state: "visible", timeout: 10000 });
+    debug.folderPickerOpened = true;
+    debug.exactFolderFound = await page.getByText(new RegExp(`^\\s*${escapeRegExp(folderName)}\\s*$`, "i")).count() > 0;
+
+    const chosen = await chooseFolder(dialog, folderName);
+    if (!chosen) {
+      throw new Error(`Unable to choose exact folder "${folderName}" for "${itemName}".`);
+    }
+    debug.folderSelected = true;
+
+    const submitButton = dialog.getByRole("button", { name: /^Move$/i }).first();
+    if (!(await isVisible(submitButton))) {
+      throw new Error(`Unable to find exact Move confirmation for "${itemName}".`);
+    }
+    await submitButton.click({ force: true });
+    debug.confirmationClicked = true;
+    await dialog.waitFor({ state: "hidden", timeout: 10000 });
+
+    await refreshCustomValuesPage(page);
+    debug.refreshCompleted = true;
+    debug.valueFoundInsideFolder = await openFolderAndVerifyCustomValue(page, folderName, itemName, itemId);
+    logFolderStep("10 association verified", JSON.stringify(debug));
+    console.log(`CUSTOM_VALUE_FOLDER_DEBUG:${JSON.stringify(debug)}`);
+    return { moved: true, skipped: false, rowFound: true, folderVerified: true, debug };
+  } catch (error) {
+    console.log(`CUSTOM_VALUE_FOLDER_DEBUG:${JSON.stringify(debug)}`);
+    throw error;
+  }
 }
 
 async function ensureValue(page, item, folderName) {
   const body = await currentBodyText(page);
   if (body.includes(normalize(item.name))) {
+    if (folderName) {
+      await moveCustomValueToFolder(page, item.name, folderName);
+      return { created: false, skipped: false, moved: true };
+    }
     return { created: false, skipped: true };
   }
 
@@ -619,6 +784,10 @@ async function main() {
           throw new Error(`API ensure failed for "${item.name}".`);
         }
 
+        if (FOLDER_NAME) {
+          await moveCustomValueToFolder(page, item.name, FOLDER_NAME);
+        }
+
         values.push({ name: item.name, status });
         if (status === "created") {
           summary.created += 1;
@@ -679,6 +848,7 @@ module.exports = {
   createLocalSession,
   ensureFolder,
   ensureValue,
+  moveCustomValueToFolder,
   openCustomValuesPage,
   openSessionWithLocalFallback,
   verifyCustomValuesPage,

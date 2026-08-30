@@ -2,6 +2,7 @@ const axios = require("axios");
 
 const BASE_URL =
   "https://services.leadconnectorhq.com";
+const VERSION = "2021-07-28";
 
 function createClient(token) {
   return axios.create({
@@ -10,7 +11,7 @@ function createClient(token) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      Version: "2021-07-28",
+      Version: VERSION,
     },
 
     timeout: 30000,

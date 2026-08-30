@@ -3,177 +3,85 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ClearOps - GHL Cleanup</title>
+  <title>Custom Value Studio - GHL Custom Value Engine</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
+    <aside class="sidebar" id="app-sidebar">
       <div class="brand">
-        <div class="brand-mark">C</div>
-        <div>
-          <strong>ClearOps</strong>
-          <span>GHL Cleanup</span>
-        </div>
+        <div class="brand-mark" aria-hidden="true"><span>CV</span></div>
+        <div><strong>Custom Value Studio</strong><span>GHL Custom Value Engine</span></div>
       </div>
-      <nav>
-        <a class="active" href="#workspace">Workspace</a>
-        <a href="#inventory">Inventory</a>
-        <a href="#danger">Danger zone</a>
+      <nav class="sidebar-nav" aria-label="Primary navigation">
+        <a class="active" href="#dashboard"><span class="nav-icon">D</span>Dashboard</a>
+        <a href="#workspace"><span class="nav-icon">C</span>Connect GHL</a>
+        <a href="#custom-values"><span class="nav-icon">V</span>Custom Values</a>
+        <a href="#manual-entry"><span class="nav-icon">+</span>Manual Entry</a>
+        <a href="#file-import"><span class="nav-icon">U</span>Import File</a>
+        <a href="#history"><span class="nav-icon">H</span>History</a>
       </nav>
-      <div class="sidebar-note">
-        <span class="dot"></span>Runs locally on this computer
-      </div>
+      <div class="sidebar-divider"></div>
+      <a class="sidebar-settings" href="#workspace"><span class="nav-icon">S</span>Connection settings</a>
+      <div class="sidebar-note"><span class="dot"></span><span>Secure local session</span></div>
     </aside>
 
     <main class="main">
+      <button class="mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-controls="app-sidebar" aria-expanded="false">Menu</button>
       <header class="topbar">
-        <div>
-          <p class="kicker">OPERATIONS CONSOLE</p>
-          <h1>Clean a GHL subaccount safely</h1>
-          <p>Scan through the API, then delete only what you choose.</p>
-        </div>
-        <div class="status-pill" id="top-status">Not connected</div>
+        <div><p class="breadcrumb"><span>Workspace</span><span>/</span><strong>Dashboard</strong></p><h1>Good to see you</h1><p>Create, update, organize, and manage your GHL Custom Values.</p></div>
+        <div class="topbar-actions"><div class="status-pill" id="top-status"><span class="status-dot"></span>Not connected</div><a class="avatar" href="#workspace" aria-label="Open connection settings">CV</a></div>
       </header>
 
-      <section id="workspace" class="panel connection-panel">
-        <div class="panel-title">
-          <div>
-            <h2>Connect GHL Account</h2>
-            <p>Development Connection. Your token stays on the server for this session and is not shown again.</p>
-          </div>
-          <span class="step">01</span>
+      <section id="dashboard" class="dashboard-section">
+        <div class="section-heading"><div><p class="eyebrow">OVERVIEW</p><h2>Workspace overview</h2></div><span class="section-caption">Your connected GHL location at a glance</span></div>
+        <div class="metric-grid">
+          <article class="metric-card"><div class="metric-icon blue">V</div><div><span>Custom Values</span><strong id="dashboard-custom-values">-</strong><small>Loaded from GHL</small></div></article>
+          <article class="metric-card"><div class="metric-icon violet">F</div><div><span>Folders</span><strong id="dashboard-folders">-</strong><small>Available in this location</small></div></article>
+          <article class="metric-card"><div class="metric-icon amber">U</div><div><span>Last import</span><strong id="dashboard-last-import">Not yet</strong><small>Updates appear here</small></div></article>
+          <article class="metric-card"><div class="metric-icon green">C</div><div><span>Connection</span><strong id="dashboard-connection">Not connected</strong><small>Private session status</small></div></article>
         </div>
-        <form id="connection-form">
-          <div class="field">
-            <label for="integration-token">GHL Integration Token</label>
-            <small class="field-hint">Paste your GHL Private Integration Token here, not the Location ID.</small>
-            <div class="token-wrap">
-              <input id="integration-token" type="password" autocomplete="off" required placeholder="Paste token">
-              <button id="toggle-token" type="button" class="ghost">Show</button>
+        <div class="quick-actions"><span>Quick actions</span><a href="#file-import">Import Excel / CSV <b>-&gt;</b></a><a href="#manual-entry">Add Custom Value <b>-&gt;</b></a><a href="#custom-values">View inventory <b>-&gt;</b></a></div>
+      </section>
+
+      <section id="workspace" class="workspace-card connection-panel">
+        <div class="section-heading"><div><p class="eyebrow">GET STARTED</p><h2>Connect GHL</h2><p>Connect a GHL location to begin managing its Custom Values.</p></div><span class="section-badge">Secure connection</span></div>
+        <div class="connection-layout">
+          <form id="connection-form">
+            <div class="connection-form-fields">
+              <div class="field"><label for="integration-token">Private Integration Token</label><small class="field-hint">Your token is used only for this local session.</small><div class="token-wrap"><input id="integration-token" type="password" autocomplete="off" required placeholder="pit-..."><button id="toggle-token" type="button" class="ghost">Show</button></div></div>
+              <div class="field"><label for="connection-location-id">Location ID</label><small class="field-hint">Enter the exact GHL location for this workspace.</small><input id="connection-location-id" type="text" autocomplete="off" required placeholder="CKk3Iy0oAsWhfUukk9xv"></div>
             </div>
-          </div>
-          <button id="test-button" class="primary" type="submit">Connect account</button>
-        </form>
-        <div class="connection-meta">
-          <div>
-            <span>Account</span>
-            <strong id="account-name-inline">Not connected</strong>
-          </div>
-          <div>
-            <span>Selected Location</span>
-            <strong id="selected-location-inline">None</strong>
-            <code id="selected-location-id-inline">-</code>
-          </div>
+            <button id="test-button" class="primary" type="submit">Connect GHL Account</button>
+          </form>
+          <div class="connection-preview"><span class="connection-preview-label">Current session</span><div class="connection-preview-status"><span class="status-dot"></span><strong id="account-name-inline">Not connected</strong></div><div class="connection-preview-row"><span>Selected location</span><strong id="selected-location-inline">None</strong></div><code id="selected-location-id-inline">-</code></div>
         </div>
+        <div class="connection-meta hidden"><div><span>Account</span><strong>Not connected</strong></div><div><span>Selected Location</span><strong>None</strong><code>-</code></div></div>
         <div id="connection-locations" class="connection-locations hidden"></div>
-        <div class="connection-actions">
-          <button id="refresh-locations" class="ghost" type="button" disabled>Refresh locations</button>
-          <button id="change-location" class="ghost" type="button" disabled>Change location</button>
-          <button id="disconnect-button" class="danger-outline" type="button" disabled>Disconnect</button>
-        </div>
+        <div class="connection-actions"><button id="refresh-locations" class="ghost" type="button" disabled>Refresh locations</button><button id="change-location" class="ghost" type="button" disabled>Change location</button><button id="disconnect-button" class="danger-outline" type="button" disabled>Disconnect</button></div>
         <div id="connection-result" class="message hidden"></div>
       </section>
 
-      <section id="account-card" class="account-bar hidden">
-        <div>
-          <span>Connected account</span>
-          <strong id="account-name">-</strong>
-          <code id="account-location">-</code>
-        </div>
-        <button id="scan-button" class="primary" type="button">Scan resources</button>
+      <section id="account-card" class="account-bar hidden"><div><span><i class="status-dot"></i> Connected GHL account</span><strong id="account-name">-</strong><code id="account-location">-</code></div><button id="refresh-inventory" class="ghost light" type="button">Refresh inventory</button></section>
+
+      <section id="custom-values" class="workspace-card custom-values-panel">
+        <div class="section-heading"><div><p class="eyebrow">INVENTORY</p><h2>Custom Values</h2><p>Review values, folders, and verification status for the active location.</p></div><span class="section-badge neutral">Live inventory</span></div>
+        <div class="custom-values-inventory-head"><div><strong>All Custom Values</strong><span>Fresh readback from GHL</span></div><a class="text-link" href="#file-import">Import values <b>-&gt;</b></a></div>
+        <div id="custom-values-inventory" class="custom-values-inventory hidden"></div>
       </section>
 
-      <section id="custom-values" class="panel custom-values-panel">
-        <div class="panel-title">
-          <div>
-            <h2>Custom Values Setup</h2>
-            <p>Scan the current custom values, preview CSV/XLSX imports, and keep manual rows available when needed.</p>
-          </div>
-          <span class="step">02</span>
-        </div>
+      <section id="file-import" class="workspace-card custom-values-panel">
+        <div class="section-heading"><div><p class="eyebrow">WORKSPACE</p><h2>Manage Custom Values</h2><p>Use manual entry for a few values, or import a spreadsheet for larger updates.</p></div><span class="section-badge neutral">Create &amp; update</span></div>
         <form id="custom-values-form">
-          <div class="field custom-folder-field">
-            <label for="custom-value-folder-name">Target Folder</label>
-            <input id="custom-value-folder-name" autocomplete="off" placeholder="GHL Cleaner Test - CV Folder">
-          </div>
-          <div class="field custom-import-field">
-            <label for="custom-value-import-file">Upload CSV/XLSX</label>
-            <input id="custom-value-import-file" type="file" accept=".csv,.xlsx,.xls">
-          </div>
-          <div id="custom-value-rows" class="custom-value-rows"></div>
-          <button id="custom-value-add" class="ghost add-row" type="button">+ Add Custom Value</button>
-          <div class="custom-values-actions">
-            <button id="custom-value-preview" class="ghost" type="button">Preview import</button>
-            <button id="custom-value-confirm" class="primary" type="button" disabled>Confirm import</button>
-            <button id="custom-values-submit" class="primary" type="submit">Apply custom values</button>
+          <div class="management-grid">
+            <div id="manual-entry" class="subsection"><div class="subsection-heading"><div><h3>Manual entry</h3><p>Add or update values one at a time.</p></div><span class="subsection-number">01</span></div><div class="field custom-folder-field"><label for="custom-value-folder-name">Target folder</label><input id="custom-value-folder-name" autocomplete="off" placeholder="e.g. GHL Home Page"><small class="field-hint">All manual rows below will use this folder.</small></div><div id="custom-value-rows" class="custom-value-rows"></div><button id="custom-value-add" class="ghost add-row" type="button">+ Add another value</button><button id="custom-values-submit" class="primary full-width" type="submit">Apply manual values</button></div>
+            <div class="subsection import-subsection"><div class="subsection-heading"><div><h3>Import file</h3><p>Upload CSV or XLSX with one row per value.</p></div><span class="subsection-number">02</span></div><label class="file-dropzone" for="custom-value-import-file"><span class="upload-icon">U</span><strong>Drop your file here</strong><span>or <u>choose a file</u></span><small>Name | Value | Folder</small><span id="custom-file-name" class="file-name">No file selected</span><input id="custom-value-import-file" type="file" accept=".csv,.xlsx,.xls"></label><div class="import-actions"><button id="custom-value-preview" class="ghost" type="button">Preview changes</button><button id="custom-value-confirm" class="primary" type="button" disabled>Confirm import</button></div></div>
           </div>
         </form>
-        <div class="custom-values-inventory-head">
-          <strong>Current Custom Values</strong>
-          <span>Visible from the active connection before import</span>
-        </div>
-        <div id="custom-values-inventory" class="custom-values-inventory hidden"></div>
-        <div id="custom-values-preview" class="custom-values-preview hidden"></div>
-        <div id="custom-values-result" class="message hidden"></div>
+        <div id="custom-values-preview" class="custom-values-preview hidden"></div><div id="custom-values-result" class="message hidden"></div>
       </section>
 
-      <section id="inventory" class="hidden">
-        <div class="metrics">
-          <div><span>Total loaded</span><strong id="metric-total">0</strong></div>
-          <div><span>Categories</span><strong id="metric-categories">0</strong></div>
-          <div><span>Selected</span><strong id="metric-selected">0</strong></div>
-          <div><span>Deletion ready</span><strong id="metric-ready">0</strong></div>
-        </div>
-        <div class="panel">
-          <div class="inventory-head">
-            <div>
-              <p class="kicker">RESOURCE INVENTORY</p>
-              <h2>Choose what to remove</h2>
-            </div>
-            <button id="rescan-button" class="ghost" type="button">Rescan</button>
-          </div>
-          <div id="scan-status" class="message">Waiting to scan.</div>
-          <div id="category-tabs" class="tabs"></div>
-          <div id="resource-toolbar" class="toolbar hidden">
-            <input id="global-search" type="search" placeholder="Search this category">
-            <select id="selection-filter">
-              <option value="all">All items</option>
-              <option value="selected">Selected only</option>
-              <option value="unselected">Unselected only</option>
-            </select>
-            <button id="select-filtered" class="ghost" type="button">Select filtered</button>
-            <button id="clear-category" class="ghost" type="button">Clear</button>
-            <button id="delete-category" class="danger-outline hidden" type="button">Delete selected category</button>
-          </div>
-          <div id="resource-table" class="table-wrap"></div>
-        </div>
-      </section>
-
-      <div id="bulk-bar" class="bulk-bar hidden">
-        <div>
-          <strong id="bulk-count">0 selected</strong>
-          <span>Only checked items will be deleted.</span>
-        </div>
-        <button id="clear-all-selection" class="ghost light" type="button">Clear selection</button>
-        <button id="delete-selected" class="danger" type="button">Delete selected</button>
-      </div>
-
-      <section id="danger" class="panel danger-zone hidden">
-        <div>
-          <p class="kicker danger-text">DANGER ZONE</p>
-          <h2>Delete everything supported</h2>
-          <p>API items use the key. Workflows, Funnels, and Forms use separate browsers.</p>
-        </div>
-        <button id="delete-all" class="danger-outline" type="button">Delete everything</button>
-      </section>
-
-      <div id="modal" class="modal hidden">
-        <div class="modal-card">
-          <button id="modal-close" class="modal-x" type="button">×</button>
-          <div id="modal-content"></div>
-        </div>
-      </div>
+      <section id="history" class="workspace-card history-placeholder"><div><p class="eyebrow">HISTORY</p><h2>Import history</h2><p>Recent activity will appear here as you manage this location.</p></div><span class="section-badge neutral">Coming soon</span></section>
     </main>
   </div>
   <script src="/app.js"></script>

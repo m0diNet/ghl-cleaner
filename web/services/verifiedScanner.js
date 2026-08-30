@@ -6,6 +6,7 @@ const {
 } = require("./customValuesImport");
 
 const BASE_URL = "https://services.leadconnectorhq.com";
+const DEFAULT_VERSION = "2021-07-28";
 
 function createClient(token, version) {
   return axios.create({
@@ -14,7 +15,7 @@ function createClient(token, version) {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      Version: version,
+      Version: version || DEFAULT_VERSION,
     },
   });
 }

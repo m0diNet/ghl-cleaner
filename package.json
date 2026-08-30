@@ -1,11 +1,11 @@
 {
-  "name": "clearops-ghl-cleanup-service",
+  "name": "custom-value-studio",
   "version": "3.0.0",
-  "description": "Local GHL resource cleanup service",
+  "description": "Local GHL custom values service",
   "main": "index.js",
   "scripts": {
     "start": "node web/server.js",
-    "check": "node --check web/server.js && node --check web/public/app.js && node --check web/services/ghlApi.js && node --check web/services/connectionStore.js && node --check web/services/ghlConnection.js && node --check web/services/customValuesApi.js && node --check web/services/customValuesImport.js && node --check browser-cleanup.js && node --check browser-local/forms.js && node --check browser-local/workflows.js && node --check browser-v2/funnels.js && node --check scripts/ensure-custom-values.js && node --check scripts/custom-values-import.js && node --check scripts/delete-job-regression.js && node --check scripts/connection-regression.js && node --check scripts/custom-values-import-regression.js && node --check scripts/form-delete-job-regression.js && node --check scripts/workflow-delete-job-regression.js && node --check scripts/funnel-delete-job-regression.js && node --check scripts/api-delete-regression.js"
+    "check": "node --check web/server.js && node --check web/public/app.js && node --check web/services/connectionStore.js && node --check web/services/ghlConnection.js && node --check web/services/customValuesApi.js && node --check web/services/customValuesImport.js && node --check scripts/ensure-custom-values.js && node --check scripts/custom-values-import.js && node --check scripts/connection-regression.js && node --check scripts/custom-values-import-regression.js"
   },
   "keywords": [],
   "author": "",

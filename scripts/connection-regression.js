@@ -1,8 +1,11 @@
 const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
 const { createConnectionStore } = require("../web/services/connectionStore");
 const {
   classifyConnectionError,
   discoverAccessibleLocations,
+  validateConnectionForLocation,
   validateConnection,
   validateLocationAccess,
 } = require("../web/services/ghlConnection");
@@ -61,6 +64,11 @@ function isLocationIdLike(value) {
   return Boolean(trimmed) && /^[A-Za-z0-9]{18,28}$/.test(trimmed) && !trimmed.includes(".") && !trimmed.includes(" ");
 }
 
+function isPitLikeToken(value) {
+  const trimmed = String(value || "").trim();
+  return Boolean(trimmed) && trimmed.toLowerCase().startsWith("pit-") && trimmed.length > 8 && !trimmed.includes(" ");
+}
+
 async function expectReject(promise, code) {
   await assert.rejects(
     promise,
@@ -96,6 +104,16 @@ async function main() {
   assert.strictEqual(connection.token, undefined, "Public connection snapshot must not include the token.");
   assert.ok(browserStatePath.includes(sessionId), "Browser state path should be tied to the session.");
 
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "web", "public", "app.js"), "utf8");
+  const connectionSource = fs.readFileSync(path.join(__dirname, "..", "web", "services", "ghlConnection.js"), "utf8");
+  const indexSource = fs.readFileSync(path.join(__dirname, "..", "web", "public", "index.html"), "utf8");
+  assert.ok(appSource.includes('startsWith("pit-")'), "UI token validation should accept PIT prefixes.");
+  assert.ok(!appSource.includes('parts.length === 3'), "UI token validation must not require JWT shape.");
+  assert.ok(indexSource.includes("connection-location-id"), "The connection form should expose a separate Location ID field.");
+  assert.ok(connectionSource.includes('startsWith("pit-")'), "Server token validation should accept PIT prefixes.");
+  assert.ok(!connectionSource.includes('parts.length !== 3'), "Server token validation must not require JWT shape.");
+  assert.ok(connectionSource.includes("validateConnectionForLocation"), "The server should use the manual connection validation helper.");
+
   const selected = store.setSelectedLocation(req, res, {
     id: "loc-1",
     name: "Location One",
@@ -110,13 +128,39 @@ async function main() {
   );
 
   assert.ok(isLocationIdLike("CKk3Iy0oAsWhfUukk9xv"), "Location IDs should be detectable locally.");
+  assert.ok(isPitLikeToken("pit-example-token"), "PITs should be detectable locally.");
+  assert.ok(!isPitLikeToken("header.payload.signature"), "PIT validation must not require JWT shape.");
+  assert.ok(appSource.includes("locationId, mode: \"manual-token-location\""), "The connection submit payload should include a Location ID.");
+
+  await assert.rejects(
+    validateConnectionForLocation("pit-manual", "", {
+      clientFactory: makeClientFactory({}, []),
+    }),
+    (error) => error.code === "INVALID_LOCATION_ID",
+    "Location ID should be required separately from the token."
+  );
+
+  const manualCalls = [];
+  const manual = await validateConnectionForLocation("pit-manual", "loc-1", {
+    clientFactory: makeClientFactory(
+      {
+        "/locations/loc-1": {
+          data: { location: { id: "loc-1", name: "Location One", companyName: "Acme Co" } },
+        },
+      },
+      manualCalls
+    ),
+  });
+  assert.strictEqual(manual.selectedLocationId, "loc-1", "Manual connection should store the selected location id.");
+  assert.strictEqual(manualCalls.length, 1, "Manual connection should not require agency discovery.");
+  assert.strictEqual(manualCalls[0].path, "/locations/loc-1", "Manual connection should validate the exact location pair.");
 
   const invalidTokenCalls = [];
   await expectReject(
-    validateConnection("bad-token", {
+    validateConnectionForLocation("bad-token", "loc-1", {
       clientFactory: makeClientFactory(
         {
-          "/users/search": {
+          "/locations/loc-1": {
             error: {
               status: 401,
               response: { status: 401, data: { message: "Invalid JWT" } },
@@ -130,19 +174,31 @@ async function main() {
   );
   assert.strictEqual(invalidTokenCalls.length, 0, "Malformed tokens should be rejected before any GHL request.");
 
-  const forbiddenCalls = [];
+  const pitInvalidCalls = [];
   await expectReject(
-    validateConnection("header.payload.signature", {
+    validateConnectionForLocation("pit-invalid", "loc-1", {
       clientFactory: makeClientFactory(
         {
-          "/users/search": { data: { users: [{ id: "user-1" }] } },
-          "/locations/search": {
+          "/locations/loc-1": {
             error: {
-              status: 403,
-              response: { status: 403, data: { message: "Forbidden resource" } },
+              status: 401,
+              response: { status: 401, data: { message: "Invalid JWT" } },
             },
           },
-          "/locations": {
+        },
+        pitInvalidCalls
+      ),
+    }),
+    "INVALID_TOKEN"
+  );
+  assert.strictEqual(pitInvalidCalls[0].path, "/locations/loc-1", "PIT-shaped tokens should reach HighLevel for location validation.");
+
+  const forbiddenCalls = [];
+  await expectReject(
+    validateConnectionForLocation("pit-forbidden", "loc-1", {
+      clientFactory: makeClientFactory(
+        {
+          "/locations/loc-1": {
             error: {
               status: 403,
               response: { status: 403, data: { message: "Forbidden resource" } },
@@ -152,12 +208,12 @@ async function main() {
         forbiddenCalls
       ),
     }),
-    "TOKEN_VALID_BUT_FORBIDDEN"
+    "TOKEN_FORBIDDEN_FOR_LOCATION"
   );
-  assert.strictEqual(forbiddenCalls[0].path, "/users/search", "Forbidden tokens should still probe the auth endpoint first.");
+  assert.strictEqual(forbiddenCalls[0].path, "/locations/loc-1", "Forbidden tokens should be checked against the requested location.");
 
   const discoveryCalls = [];
-  const discovery = await validateConnection("header.payload.signature", {
+  const discovery = await validateConnection("pit-discovery", {
     clientFactory: makeClientFactory(
       {
         "/users/search": { data: { users: [{ id: "user-1" }] } },
@@ -176,8 +232,22 @@ async function main() {
   assert.strictEqual(discoveryCalls[1].path, "/locations/search", "Discovery should then load accessible locations.");
 
   const noLocationsCalls = [];
+  const subAccount = await validateConnection("pit-sub-account", {
+    allowNoAccessibleLocations: true,
+    clientFactory: makeClientFactory(
+      {
+        "/users/search": { data: { users: [{ id: "user-1" }] } },
+        "/locations/search": { data: { locations: [] } },
+        "/locations": { data: { locations: [] } },
+      },
+      noLocationsCalls
+    ),
+  });
+  assert.strictEqual(subAccount.locations.length, 0, "Sub-account PITs should be able to proceed without agency discovery.");
+  assert.strictEqual(noLocationsCalls[0].path, "/users/search", "Sub-account PITs should still probe the auth endpoint first.");
+
   await expectReject(
-    validateConnection("header.payload.signature", {
+    validateConnection("pit-no-locations", {
       clientFactory: makeClientFactory(
         {
           "/users/search": { data: { users: [{ id: "user-1" }] } },
@@ -190,7 +260,7 @@ async function main() {
     "NO_ACCESSIBLE_LOCATIONS"
   );
 
-  const validatedLocation = await validateLocationAccess("header.payload.signature", "loc-1", {
+  const validatedLocation = await validateLocationAccess("pit-discovery", "loc-1", {
     clientFactory: makeClientFactory(
       {
         "/locations/loc-1": {
@@ -203,7 +273,7 @@ async function main() {
   assert.strictEqual(validatedLocation.id, "loc-1", "The selected location should validate successfully.");
 
   await expectReject(
-    validateLocationAccess("header.payload.signature", "bad-location", {
+    validateLocationAccess("pit-discovery", "bad-location", {
       clientFactory: makeClientFactory(
         {
           "/locations/bad-location": {
@@ -216,10 +286,10 @@ async function main() {
         []
       ),
     }),
-    "LOCATION_NOT_AUTHORIZED"
+    "TOKEN_FORBIDDEN_FOR_LOCATION"
   );
 
-  const discoveredAgain = await discoverAccessibleLocations("header.payload.signature", {
+  const discoveredAgain = await discoverAccessibleLocations("pit-discovery", {
     clientFactory: makeClientFactory(
       {
         "/locations/search": {
@@ -251,6 +321,7 @@ async function main() {
     `CONNECTION_REGRESSION_JSON:${JSON.stringify({
       malformedTokenRejected: true,
       locationIdRejectedLocally: true,
+      manualConnectionWithoutDiscovery: true,
       invalidTokenClassification: true,
       forbiddenTokenClassification: true,
       accessibleLocationsReturnedSafely: true,

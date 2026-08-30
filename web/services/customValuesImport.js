@@ -158,16 +158,22 @@ function normalizeExistingCustomValue(item) {
   };
 }
 
-function normalizeImportRow(row, fallbackFolderName = "") {
+function normalizeImportRow(row, options = {}) {
+  const {
+    fallbackFolderName = "",
+    requireFolder = false,
+  } = options && typeof options === "object" ? options : {};
   const source = row && typeof row === "object" ? row : {};
   const name = normalizeName(source.name || source.key || source.fieldKey);
   const value = toText(source.value);
+  const folderId = toText(source.folderId || source.parentId || "");
   const folderName = normalizeName(source.folderName || fallbackFolderName || "");
 
-  const invalid = !name || !value;
+  const invalid = !name || (requireFolder && !folderName);
   return {
     name,
     value,
+    folderId: folderId || null,
     folderName: folderName || null,
     raw: source,
     invalid,
@@ -178,7 +184,11 @@ function getRowFolderTarget(row, fallbackFolderName = "") {
   return normalizeName(row.folderName || fallbackFolderName || "") || null;
 }
 
-function classifyCustomValueRows(importRows, existingItems, fallbackFolderName = "") {
+function classifyCustomValueRows(importRows, existingItems, fallbackFolderName = "", options = {}) {
+  const {
+    fileMode = false,
+    requireFolder = fileMode,
+  } = options && typeof options === "object" ? options : {};
   const normalizedExisting = (Array.isArray(existingItems) ? existingItems : [])
     .map(normalizeExistingCustomValue)
     .filter((item) => item.id && item.name);
@@ -200,8 +210,23 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
   let invalid = 0;
 
   for (const importRow of Array.isArray(importRows) ? importRows : []) {
-    const row = normalizeImportRow(importRow, fallbackFolderName);
-    const targetFolder = getRowFolderTarget(row, fallbackFolderName);
+    const row = normalizeImportRow(importRow, {
+      fallbackFolderName: fileMode ? "" : fallbackFolderName,
+      requireFolder,
+    });
+    const targetFolder = getRowFolderTarget(row, fileMode ? "" : fallbackFolderName);
+    const matchingFolderItems = targetFolder
+      ? normalizedExisting.filter(
+        (item) => normalizeName(item.folderName || "") === normalizeName(targetFolder)
+      )
+      : [];
+    const preliminaryFolderStatus = !targetFolder
+      ? "INVALID"
+      : matchingFolderItems.some((item) => item.folderId)
+        ? "EXISTING"
+        : matchingFolderItems.length
+          ? "UNKNOWN_ID"
+          : "UNKNOWN";
 
     if (row.invalid) {
       invalid += 1;
@@ -212,9 +237,10 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
         importedValue: row.value || "",
         existingFolder: "",
         targetFolder,
+        folderStatus: preliminaryFolderStatus,
         existingId: "",
         targetFolderId: "",
-        reason: "Missing required name or value.",
+        reason: requireFolder ? "Missing required name or folder." : "Missing required name.",
         raw: row.raw,
       });
       continue;
@@ -231,6 +257,7 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
         importedValue: row.value,
         existingFolder: "",
         targetFolder,
+        folderStatus: preliminaryFolderStatus,
         existingId: "",
         targetFolderId: "",
         reason: "Multiple existing Custom Values match this name.",
@@ -241,10 +268,26 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
 
     const existing = matches[0] || null;
     const desiredFolder = targetFolder || existing?.folderName || null;
-    const folderChanged =
-      Boolean(existing) &&
-      Boolean(desiredFolder) &&
-      normalize(existing.folderName || "") !== normalize(desiredFolder);
+    const catalogTargetFolderId = matchingFolderItems.find((item) => item.folderId)?.folderId || "";
+    const targetFolderId =
+      row.folderId ||
+      catalogTargetFolderId ||
+      (existing && !matchingFolderItems.length ? existing.folderId || "" : "");
+    const folderStatus = !targetFolder
+      ? "INVALID"
+      : targetFolderId
+        ? "EXISTING"
+        : matchingFolderItems.length
+          ? "UNKNOWN_ID"
+          : existing
+            ? "UNKNOWN"
+            : "CREATE";
+    const folderChanged = Boolean(existing) && Boolean(desiredFolder) && (
+      targetFolderId && existing.folderId
+        ? existing.folderId !== targetFolderId
+        : Boolean(existing.folderName) && Boolean(targetFolder) &&
+          normalize(existing.folderName) !== normalize(targetFolder)
+    );
     const valueChanged = Boolean(existing) && String(existing.value || "") !== String(row.value || "");
 
     if (!existing) {
@@ -256,8 +299,9 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
         importedValue: row.value,
         existingFolder: "",
         targetFolder: desiredFolder,
+        folderStatus,
         existingId: "",
-        targetFolderId: "",
+        targetFolderId,
         reason: "",
         raw: row.raw,
       });
@@ -273,8 +317,9 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
         importedValue: row.value,
         existingFolder: existing.folderName || "",
         targetFolder: desiredFolder,
+        folderStatus,
         existingId: existing.id,
-        targetFolderId: existing.folderId || "",
+        targetFolderId,
         reason: "",
         raw: row.raw,
       });
@@ -289,8 +334,9 @@ function classifyCustomValueRows(importRows, existingItems, fallbackFolderName =
       importedValue: row.value,
       existingFolder: existing.folderName || "",
       targetFolder: desiredFolder,
+      folderStatus,
       existingId: existing.id,
-      targetFolderId: existing.folderId || "",
+      targetFolderId,
       reason: "",
       raw: row.raw,
     });
@@ -318,26 +364,53 @@ function extractCustomValueItems(data) {
   return [];
 }
 
-function buildCustomValueInventory(items) {
+function buildCustomValueInventory(items, folderRecords = []) {
   const normalized = (Array.isArray(items) ? items : []).map(normalizeExistingCustomValue);
   const folders = [];
   const seen = new Set();
 
-  for (const item of normalized) {
-    const folderKey = `${normalize(item.folderName || "")}|${normalize(item.folderId || "")}`;
-    if (!item.folderName || seen.has(folderKey)) {
+  for (const rawFolder of Array.isArray(folderRecords) ? folderRecords : []) {
+    const folderId = toText(rawFolder?.folderId || rawFolder?.id || rawFolder?._id);
+    const folderName = toText(rawFolder?.folderName || rawFolder?.name || rawFolder?.title);
+    if (!folderId && !folderName) {
+      continue;
+    }
+    const folderKey = folderId ? `id:${folderId}` : `name:${normalize(folderName)}`;
+    if (seen.has(folderKey)) {
       continue;
     }
     seen.add(folderKey);
     folders.push({
-      folderId: item.folderId || "",
-      folderName: item.folderName || "",
+      folderId,
+      folderName,
+      folderNameResolved: Boolean(folderName),
+      source: "folder-catalog",
+    });
+  }
+
+  for (const item of normalized) {
+    const folderId = toText(item.folderId);
+    const folderName = toText(item.folderName);
+    if (!folderId && !folderName) {
+      continue;
+    }
+    const folderKey = folderId ? `id:${folderId}` : `name:${normalize(folderName)}`;
+    if (seen.has(folderKey)) {
+      continue;
+    }
+    seen.add(folderKey);
+    folders.push({
+      folderId,
+      folderName,
+      folderNameResolved: Boolean(folderName),
+      source: "custom-value-association",
     });
   }
 
   return {
     items: normalized,
     folders,
+    folderCatalogAvailable: Array.isArray(folderRecords) && folderRecords.length > 0,
   };
 }
 

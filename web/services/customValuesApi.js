@@ -26,11 +26,28 @@ function createClient(token, clientFactory = axios.create) {
   });
 }
 
+function buildCustomValuePayload(item) {
+  return {
+    name: toText(item.name),
+    value: toText(item.value),
+  };
+}
+
+function extractCustomValueFolders(data) {
+  const candidates = [
+    data?.folders,
+    data?.customValueFolders,
+    data?.data?.folders,
+    data?.data?.customValueFolders,
+  ];
+  return candidates.find((value) => Array.isArray(value)) || [];
+}
+
 async function listCustomValues(locationId, token, { clientFactory = axios.create } = {}) {
   const client = createClient(token, clientFactory);
   const response = await client.get(`/locations/${locationId}/customValues`);
   const items = extractCustomValueItems(response.data).map(normalizeExistingCustomValue);
-  return buildCustomValueInventory(items);
+  return buildCustomValueInventory(items, extractCustomValueFolders(response.data));
 }
 
 function matchByName(items, name) {
@@ -40,37 +57,14 @@ function matchByName(items, name) {
 
 async function createCustomValue(locationId, token, item, { clientFactory = axios.create } = {}) {
   const client = createClient(token, clientFactory);
-  const payload = {
-    name: toText(item.name),
-    value: toText(item.value),
-  };
-
-  if (item.folderId) {
-    payload.folderId = toText(item.folderId);
-  }
-
-  if (item.folderName) {
-    payload.folderName = toText(item.folderName);
-  }
-
+  const payload = buildCustomValuePayload(item);
   const response = await client.post(`/locations/${locationId}/customValues`, payload);
   return response.data;
 }
 
 async function updateCustomValue(locationId, token, item, { clientFactory = axios.create } = {}) {
   const client = createClient(token, clientFactory);
-  const payload = {
-    name: toText(item.name),
-    value: toText(item.value),
-  };
-
-  if (item.folderId) {
-    payload.folderId = toText(item.folderId);
-  }
-
-  if (item.folderName) {
-    payload.folderName = toText(item.folderName);
-  }
+  const payload = buildCustomValuePayload(item);
 
   const urls = [
     `/locations/${locationId}/customValues/${encodeURIComponent(item.id)}`,
@@ -96,7 +90,7 @@ async function updateCustomValue(locationId, token, item, { clientFactory = axio
   throw lastError || new Error(`Unable to update custom value "${item.name}".`);
 }
 
-async function ensureCustomValue(locationId, token, item, { clientFactory = axios.create } = {}) {
+async function ensureCustomValue(locationId, token, item, { clientFactory = axios.create, associateFolder = null } = {}) {
   const before = await listCustomValues(locationId, token, { clientFactory });
   const matches = matchByName(before.items, item.name);
   const match = matches[0] || null;
@@ -117,22 +111,50 @@ async function ensureCustomValue(locationId, token, item, { clientFactory = axio
     folderName: folderName || "",
   };
 
+  const moveFolder = typeof associateFolder === "function" ? associateFolder : null;
+
   if (!match) {
     await createCustomValue(locationId, token, {
       ...item,
-      folderId: desiredFolder.folderId || "",
-      folderName: desiredFolder.folderName || "",
     }, { clientFactory });
+    const createdInventory = await listCustomValues(locationId, token, { clientFactory });
+    const createdMatches = matchByName(createdInventory.items, item.name);
+    const created = createdMatches.find((candidate) => String(candidate.value || "") === String(item.value || "")) || null;
+    if (!created) {
+      return {
+        status: "failed",
+        before: match,
+        after: null,
+        folder: findCustomValueFolder(createdInventory, desiredFolder.folderName, desiredFolder.folderId),
+        folderVerified: false,
+      };
+    }
+    let moveResult = null;
+    if (moveFolder && desiredFolder.folderName) {
+      moveResult = await moveFolder({
+        locationId,
+        token,
+        item: {
+          ...item,
+          id: created.id,
+        },
+        desiredFolder,
+        phase: "create",
+        clientFactory,
+      });
+    }
     const after = await listCustomValues(locationId, token, { clientFactory });
-    const createdMatches = matchByName(after.items, item.name);
-    const created = createdMatches.find((candidate) => String(candidate.value || "") === String(item.value || "")) || createdMatches[0] || null;
+    const finalCreatedMatches = matchByName(after.items, item.name);
+    const finalCreated = finalCreatedMatches.find((candidate) => String(candidate.value || "") === String(item.value || "")) || null;
     const association = verifyCustomValueFolderAssociation(after, desiredFolder.folderName, desiredFolder.folderId);
+    const folderVerified = Boolean(moveResult?.folderVerified || association.verified);
     return {
-      status: created && association.verified ? "created" : "failed",
+      status: finalCreated && folderVerified ? "created" : "failed",
       before: match,
-      after: created,
+      after: finalCreated,
       folder: association.folder,
-      folderVerified: association.verified,
+      folderVerified,
+      associationSource: moveResult?.folderVerified ? "browserless-ui" : "api-readback",
     };
   }
 
@@ -151,27 +173,42 @@ async function ensureCustomValue(locationId, token, item, { clientFactory = axio
     };
   }
 
+  let moveResult = null;
   await updateCustomValue(locationId, token, {
     ...item,
     id: match.id,
-    folderId: desiredFolder.folderId || "",
-    folderName: desiredFolder.folderName || "",
   }, { clientFactory });
+  if (moveFolder && desiredFolder.folderName) {
+    moveResult = await moveFolder({
+      locationId,
+      token,
+      item: {
+        ...item,
+        id: match.id,
+      },
+      desiredFolder,
+      phase: "update",
+      clientFactory,
+    });
+  }
   const after = await listCustomValues(locationId, token, { clientFactory });
   const updatedMatches = matchByName(after.items, item.name);
   const updated = updatedMatches.find((candidate) => String(candidate.value || "") === String(item.value || "")) || updatedMatches[0] || null;
   const association = verifyCustomValueFolderAssociation(after, desiredFolder.folderName, desiredFolder.folderId);
+  const folderVerified = Boolean(moveResult?.folderVerified || association.verified);
 
   return {
-    status: updated && association.verified ? "updated" : "failed",
+    status: updated && folderVerified ? "updated" : "failed",
     before: match,
     after: updated,
     folder: association.folder,
-    folderVerified: association.verified,
+    folderVerified,
+    associationSource: moveResult?.folderVerified ? "browserless-ui" : "api-readback",
   };
 }
 
 module.exports = {
+  buildCustomValuePayload,
   createCustomValue,
   ensureCustomValue,
   listCustomValues,

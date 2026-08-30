@@ -2,15 +2,19 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   connection: null,
-  location: null,
-  scanId: null,
-  resources: {},
-  deletable: [],
-  browserCategories: [],
-  active: null,
-  selected: new Map(),
-  search: "",
-  filter: "all",
+  loading: {
+    connect: false,
+    inventory: false,
+    preview: false,
+    import: false,
+    disconnect: false,
+  },
+  pagination: {
+    inventory: { page: 1, pageSize: 10 },
+    preview: { page: 1, pageSize: 10 },
+    results: { page: 1, pageSize: 10 },
+  },
+  resultRows: [],
   customValuesImport: {
     file: null,
     preview: null,
@@ -19,13 +23,16 @@ const state = {
     items: [],
     folders: [],
     loaded: false,
+    verified: false,
     error: "",
+    selectedFolderKey: "",
   },
 };
 
 const els = {
   form: $("connection-form"),
   token: $("integration-token"),
+  locationId: $("connection-location-id"),
   test: $("test-button"),
   toggle: $("toggle-token"),
   message: $("connection-result"),
@@ -39,28 +46,7 @@ const els = {
   refreshLocations: $("refresh-locations"),
   changeLocation: $("change-location"),
   disconnect: $("disconnect-button"),
-  scan: $("scan-button"),
-  inventory: $("inventory"),
-  scanStatus: $("scan-status"),
-  tabs: $("category-tabs"),
-  toolbar: $("resource-toolbar"),
-  table: $("resource-table"),
-  search: $("global-search"),
-  filter: $("selection-filter"),
-  selectFiltered: $("select-filtered"),
-  clearCategory: $("clear-category"),
-  deleteCategory: $("delete-category"),
-  rescan: $("rescan-button"),
-  bulk: $("bulk-bar"),
-  bulkCount: $("bulk-count"),
-  clearAll: $("clear-all-selection"),
-  deleteSelected: $("delete-selected"),
-  danger: $("danger"),
-  deleteAll: $("delete-all"),
-  modal: $("modal"),
-  modalContent: $("modal-content"),
-  modalClose: $("modal-close"),
-  topStatus: $("top-status"),
+  refreshInventory: $("refresh-inventory"),
   customForm: $("custom-values-form"),
   customFolder: $("custom-value-folder-name"),
   customRows: $("custom-value-rows"),
@@ -72,6 +58,14 @@ const els = {
   customInventory: $("custom-values-inventory"),
   customResult: $("custom-values-result"),
   customPreviewWrap: $("custom-values-preview"),
+  topStatus: $("top-status"),
+  dashboardCustomValues: $("dashboard-custom-values"),
+  dashboardFolders: $("dashboard-folders"),
+  dashboardLastImport: $("dashboard-last-import"),
+  dashboardConnection: $("dashboard-connection"),
+  customFileName: $("custom-file-name"),
+  mobileNavToggle: $("mobile-nav-toggle"),
+  sidebar: $("app-sidebar"),
 };
 
 const esc = (value) =>
@@ -81,6 +75,112 @@ const esc = (value) =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+
+function pageSlice(items, key) {
+  const values = Array.isArray(items) ? items : [];
+  const pagination = state.pagination[key];
+  const totalPages = Math.max(1, Math.ceil(values.length / pagination.pageSize));
+  pagination.page = Math.min(Math.max(1, pagination.page), totalPages);
+  const start = (pagination.page - 1) * pagination.pageSize;
+  return {
+    items: values.slice(start, start + pagination.pageSize),
+    page: pagination.page,
+    pageSize: pagination.pageSize,
+    totalPages,
+    start,
+    end: Math.min(start + pagination.pageSize, values.length),
+    total: values.length,
+  };
+}
+
+function paginationMarkup(key, total, label = "rows") {
+  const pagination = state.pagination[key];
+  const totalPages = Math.max(1, Math.ceil(total / pagination.pageSize));
+  pagination.page = Math.min(Math.max(1, pagination.page), totalPages);
+  const start = total ? (pagination.page - 1) * pagination.pageSize : 0;
+  const end = Math.min(start + pagination.pageSize, total);
+  if (totalPages <= 1) {
+    return "";
+  }
+
+  return `
+    <div class="pagination" data-pagination="${esc(key)}">
+      <span>Showing ${total ? start + 1 : 0}–${end} of ${total} ${esc(label)}</span>
+      <label>Rows per page
+        <select data-page-size="${esc(key)}">
+          ${PAGE_SIZE_OPTIONS.map((size) => `<option value="${size}" ${size === pagination.pageSize ? "selected" : ""}>${size}</option>`).join("")}
+        </select>
+      </label>
+      <button type="button" class="ghost" data-page-action="prev" data-page-key="${esc(key)}" ${pagination.page <= 1 ? "disabled" : ""}>Previous</button>
+      <span>Page ${pagination.page} of ${totalPages}</span>
+      <button type="button" class="ghost" data-page-action="next" data-page-key="${esc(key)}" ${pagination.page >= totalPages ? "disabled" : ""}>Next</button>
+    </div>
+  `;
+}
+
+function bindPagination(container, key, render) {
+  container.querySelectorAll("[data-page-action]").forEach((button) => {
+    button.onclick = () => {
+      const nextPage = state.pagination[key].page + (button.dataset.pageAction === "next" ? 1 : -1);
+      state.pagination[key].page = Math.max(1, nextPage);
+      render();
+    };
+  });
+  const size = container.querySelector(`[data-page-size="${key}"]`);
+  if (size) {
+    size.onchange = () => {
+      state.pagination[key].pageSize = Number(size.value) || 10;
+      state.pagination[key].page = 1;
+      render();
+    };
+  }
+}
+
+function setButtonLoading(button, loading, loadingText) {
+  if (!button) {
+    return;
+  }
+  if (loading) {
+    button.dataset.defaultLabel = button.textContent.trim();
+    button.innerHTML = `<span class="spinner" aria-hidden="true"></span>${esc(loadingText)}`;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  } else {
+    button.textContent = button.dataset.defaultLabel || button.textContent;
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+function showInlineLoading(element, text) {
+  if (!element) {
+    return;
+  }
+  element.className = "message loading-message";
+  element.innerHTML = `<span class="spinner" aria-hidden="true"></span>${esc(text)}`;
+  element.classList.remove("hidden");
+}
+
+function clearCustomValuesResult() {
+  state.resultRows = [];
+  state.pagination.results.page = 1;
+  els.customResult.className = "message hidden";
+  els.customResult.innerHTML = "";
+}
+
+function resetFileImportState() {
+  state.customValuesImport.file = null;
+  state.customValuesImport.preview = null;
+  state.pagination.preview.page = 1;
+  state.pagination.results.page = 1;
+  clearCustomValuesResult();
+  renderCustomValuesPreview(null);
+  if (els.customFileName) {
+    els.customFileName.textContent = "No file selected";
+  }
+}
 
 function msg(text, type = "") {
   els.message.className = `message ${type}`;
@@ -99,241 +199,350 @@ function looksLikePrivateIntegrationToken(value) {
     return false;
   }
 
-  const parts = trimmed.split(".");
-  return parts.length === 3 && parts.every((part) => Boolean(part.trim()));
+  return trimmed.toLowerCase().startsWith("pit-") && trimmed.length > 8;
 }
 
 function formatConnectionError(data) {
   const code = String(data?.code || "").trim();
   const fallback = String(data?.details || data?.message || "Connection failed.").trim();
   const map = {
-    INVALID_TOKEN: "That GHL token is invalid. Paste a valid Private Integration Token.",
-    TOKEN_VALID_BUT_FORBIDDEN: "The token is valid, but it does not have the required permission to list locations.",
-    NO_ACCESSIBLE_LOCATIONS: "This token did not return any accessible GHL locations.",
-    LOCATION_NOT_AUTHORIZED: "This token does not have access to the selected GHL location.",
+    INVALID_TOKEN: "Invalid Private Integration Token.",
+    INVALID_LOCATION_ID: "Invalid Location ID.",
+    INVALID_LOCATION: "Unable to verify this GHL location.",
+    TOKEN_FORBIDDEN_FOR_LOCATION: "Token does not have access to this Location ID.",
+    LOCATION_NOT_FOUND: "Unable to verify this GHL location.",
+    LOCATION_NOT_AUTHORIZED: "Unable to verify this GHL location.",
+    TOKEN_VALID_BUT_FORBIDDEN: "The token is valid, but it cannot list agency locations.",
+    NO_ACCESSIBLE_LOCATIONS: "The token is valid, but it cannot list agency locations.",
+    MISSING_SCOPE: "The token is missing a required scope for this request.",
+    GHL_RATE_LIMIT: "GHL rate limit reached. Please retry in a moment.",
     NETWORK_ERROR: "Could not reach GHL. Check your connection and try again.",
+    GHL_API_ERROR: "GHL API error while verifying the connection.",
     UNKNOWN_AUTH_ERROR: "GHL connection failed. Please try again.",
   };
 
   return map[code] || fallback;
 }
 
-function setFor(category) {
-  if (!state.selected.has(category)) {
-    state.selected.set(category, new Set());
+function currentConnection() {
+  return state.connection || null;
+}
+
+function selectedLocationId() {
+  return String(state.connection?.selectedLocationId || state.connection?.locationId || "").trim();
+}
+
+function syncConnectionUI() {
+  const connection = currentConnection();
+  const selected = connection?.selectedLocation || null;
+  const connected = Boolean(connection);
+  const ready = Boolean(connection && selectedLocationId());
+  const displayLocationId = selected?.id || connection?.selectedLocationId || (connected ? "Select a location" : "-");
+
+  els.account.classList.toggle("hidden", !connected);
+  els.accountName.textContent = connection?.accountName || connection?.companyName || "Not connected";
+  els.accountLocation.textContent = displayLocationId;
+  els.accountInline.textContent = connection?.accountName || connection?.companyName || "Not connected";
+  els.selectedLocationInline.textContent = selected?.name || connection?.selectedLocationName || "None";
+  els.selectedLocationIdInline.textContent = selected?.id || connection?.selectedLocationId || (connected ? "Select a location" : "-");
+  els.topStatus.innerHTML = `<span class="status-dot"></span>${ready ? "Connected" : connected ? "Location needed" : "Not connected"}`;
+  els.topStatus.classList.toggle("is-connected", ready);
+  if (els.dashboardConnection) {
+    els.dashboardConnection.textContent = ready ? "Connected" : connected ? "Needs location" : "Not connected";
   }
-  return state.selected.get(category);
+  els.test.disabled = state.loading.connect;
+  els.refreshLocations.disabled = !connected;
+  els.changeLocation.disabled = !connected;
+  els.disconnect.disabled = !connected || state.loading.disconnect;
+  els.refreshInventory.disabled = !ready || state.loading.inventory;
+  els.customPreview.disabled = !ready || state.loading.preview;
+  els.customConfirm.disabled = !ready || !state.customValuesImport.preview || state.loading.import;
+  els.customSubmit.disabled = !ready || state.loading.import;
+  els.customAdd.disabled = !ready || state.loading.import;
+  els.customImportFile.disabled = !ready || state.loading.import;
+  els.customFolder.disabled = !ready || state.loading.import;
 }
 
-function totalSelected() {
-  return [...state.selected.values()].reduce((sum, set) => sum + set.size, 0);
-}
+function renderConnectionLocations(locations = []) {
+  const selectedId = selectedLocationId();
+  const hasLocations = Array.isArray(locations) && locations.length > 0;
 
-function cloneJobItem(item) {
-  if (!item || typeof item !== "object") {
-    return null;
-  }
-
-  return {
-    ...item,
-    metadata:
-      item.metadata && typeof item.metadata === "object" && !Array.isArray(item.metadata)
-        ? { ...item.metadata }
-        : item.metadata || {},
-  };
-}
-
-function payload() {
-  const body = {};
-  for (const [category, ids] of state.selected) {
-    body[category] = (state.resources[category]?.items || [])
-      .filter((item) => ids.has(item.id))
-      .map((item) => cloneJobItem(item));
-  }
-  return body;
-}
-
-function counts() {
-  return Object.fromEntries(
-    Object.entries(state.resources).map(([category, resource]) => [
-      category,
-      Number(resource.count || 0),
-    ])
-  );
-}
-
-function metrics() {
-  const loaded = Object.values(state.resources).reduce((sum, resource) => sum + resource.items.length, 0);
-  $("metric-total").textContent = loaded;
-  $("metric-categories").textContent = Object.values(state.resources).filter((resource) => resource.count > 0).length;
-  $("metric-selected").textContent = totalSelected();
-  $("metric-ready").textContent = state.deletable.length;
-  els.bulk.classList.toggle("hidden", !totalSelected());
-  els.bulkCount.textContent = `${totalSelected()} selected`;
-  categoryButton();
-}
-
-function items() {
-  const resource = state.resources[state.active];
-  if (!resource) {
-    return [];
-  }
-
-  const query = state.search.toLowerCase();
-  return resource.items.filter((item) => {
-    const haystack = [
-      item.name,
-      item.value,
-      item.folderName,
-      item.parentName,
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    const matchesSearch = haystack.includes(query);
-    const selected = setFor(state.active).has(item.id);
-    const matchesFilter =
-      state.filter === "all" ||
-      (state.filter === "selected" && selected) ||
-      (state.filter === "unselected" && !selected);
-    return matchesSearch && matchesFilter;
-  });
-}
-
-function tabs() {
-  els.tabs.innerHTML = "";
-
-  for (const [category, resource] of Object.entries(state.resources)) {
-    const button = document.createElement("button");
-    button.className = `tab ${state.active === category ? "active" : ""}`;
-    button.innerHTML = `${esc(resource.label)} <b>${resource.count}</b>`;
-    button.onclick = () => {
-      state.active = category;
-      state.search = "";
-      state.filter = "all";
-      els.search.value = "";
-      els.filter.value = "all";
-      tabs();
-      table();
-    };
-    els.tabs.appendChild(button);
-  }
-}
-
-function table() {
-  const resource = state.resources[state.active];
-  els.toolbar.classList.toggle("hidden", !resource);
-
-  if (!resource) {
-    els.table.innerHTML = '<div class="empty">Choose a category.</div>';
-    return;
-  }
-
-  if (state.active === "customValues") {
-    renderCustomValuesInventory(resource);
-    return;
-  }
-
-  const list = items();
-  const ready = resource.verified === true;
-  const statusText = ready
-    ? `Verified ${resource.loadedCount}/${resource.reportedTotal ?? resource.loadedCount}`
-    : `Incomplete ${resource.loadedCount || 0}/${resource.reportedTotal ?? "?"}`;
-
-  els.table.innerHTML = `
-    <div class="scan-proof ${ready ? "verified" : "incomplete"}">
-      <strong>${esc(statusText)}</strong>
-      ${resource.error ? `<span>${esc(resource.error)}</span>` : ""}
-    </div>
-    <div class="table-head">
-      <span></span><span>Name</span><span>Status</span>
+  els.locations.innerHTML = `
+    <div class="connection-locations-head">
+      <strong>${hasLocations ? "Available Locations" : "Manual Location Required"}</strong>
+      <span>${hasLocations ? `${locations.length} discovered` : "Token accepted; enter a location id to continue."}</span>
     </div>
     ${
-      list.length
-        ? list
-            .map(
-              (item) => `
-                <label class="table-row">
-                  <input type="checkbox" data-id="${esc(item.id)}" ${ready ? "" : "disabled"} ${
-                setFor(state.active).has(item.id) ? "checked" : ""
-              }>
-                  <span class="item-name">${esc(item.name)}</span>
-                  <span class="badge ${ready ? "ready" : ""}">${ready ? "Verified" : "Deletion blocked"}</span>
-                </label>
-              `
-            )
-            .join("")
-        : '<div class="empty">No matching items.</div>'
-    }`;
-
-  els.table.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-    checkbox.onchange = () => {
-      if (checkbox.checked) {
-        setFor(state.active).add(checkbox.dataset.id);
-      } else {
-        setFor(state.active).delete(checkbox.dataset.id);
-      }
-      metrics();
-    };
+      hasLocations
+        ? `<div class="connection-location-list">
+            ${locations
+              .map(
+                (location) => `
+                  <button type="button" class="connection-location ${String(location.id || "") === selectedId ? "selected" : ""}" data-location-id="${esc(location.id || "")}">
+                    <span>${esc(location.name || "")}</span>
+                    <code>${esc(location.id || "")}</code>
+                  </button>
+                `
+              )
+              .join("")}
+          </div>`
+        : `<div class="connection-location-note">
+            Token accepted, but this integration cannot list agency locations. Enter/select the sub-account location you want to use.
+          </div>
+          <div class="manual-location-row">
+            <input type="text" class="manual-location-input" data-manual-location-id placeholder="Location ID">
+            <button type="button" class="primary manual-location-submit">Use location</button>
+          </div>`
+    }
+  `;
+  els.locations.classList.remove("hidden");
+  els.locations.querySelectorAll("[data-location-id]").forEach((button) => {
+    button.onclick = () => selectLocation(button.dataset.locationId);
   });
-
-  categoryButton();
+  const manualSubmit = els.locations.querySelector(".manual-location-submit");
+  if (manualSubmit) {
+    manualSubmit.onclick = () => {
+      const manualInput = els.locations.querySelector("[data-manual-location-id]");
+      selectLocation(manualInput?.value || "");
+    };
+  }
 }
 
-function categoryButton() {
-  if (!els.deleteCategory) {
+function renderCustomValuesResult({
+  created = 0,
+  updated = 0,
+  unchanged = 0,
+  failed = 0,
+  folderAssociationVerified = false,
+  note = "",
+  title = "Custom Values",
+  tone = "success",
+  rows = null,
+} = {}) {
+  if (Array.isArray(rows)) {
+    state.resultRows = rows;
+    state.pagination.results.page = 1;
+  }
+  const resultPage = pageSlice(state.resultRows, "results");
+  els.customResult.className = `message ${tone === "warning" ? "warning" : "success"}`;
+  els.customResult.innerHTML = `
+    <div class="custom-values-summary">
+      <strong>${esc(title)}</strong>
+      <span>Created: ${esc(created)}</span>
+      <span>Updated: ${esc(updated)}</span>
+      <span>Unchanged: ${esc(unchanged)}</span>
+      <span>Failed: ${esc(failed)}</span>
+      <span>Folder Association Verified: ${folderAssociationVerified ? "Yes" : "No"}</span>
+      ${note ? `<small>${esc(note)}</small>` : ""}
+    </div>
+    ${
+      state.resultRows.length
+        ? `<div class="custom-values-result-list">
+            ${resultPage.items.map((row) => `<div class="custom-values-result-row">${esc(row)}</div>`).join("")}
+          </div>
+          ${paginationMarkup("results", state.resultRows.length, "results")}`
+        : ""
+    }
+  `;
+  els.customResult.classList.remove("hidden");
+  bindPagination(els.customResult, "results", () => renderCustomValuesResult({
+    created,
+    updated,
+    unchanged,
+    failed,
+    folderAssociationVerified,
+    note,
+    title,
+    tone,
+  }));
+}
+
+function renderCustomValuesError(text) {
+  state.resultRows = [];
+  els.customResult.className = "message error";
+  els.customResult.textContent = text;
+  els.customResult.classList.remove("hidden");
+}
+
+function hasImportSummary(data) {
+  return ["created", "updated", "unchanged", "failed"].some((key) => Number(data?.[key] || 0) > 0)
+    || (Array.isArray(data?.verificationFailures) && data.verificationFailures.length > 0);
+}
+
+function inventoryFolderKey(value) {
+  const folderId = String(value?.folderId || "").trim();
+  if (folderId) {
+    return `id:${folderId}`;
+  }
+  const folderName = String(value?.folderName || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return folderName ? `name:${folderName}` : "";
+}
+
+function inventoryFolderLabel(folder) {
+  return String(folder?.folderName || "").trim() || "Folder name unavailable";
+}
+
+function renderCustomValuesInventoryPanel() {
+  const inventory = state.customValuesInventory || {};
+  const items = Array.isArray(inventory.items) ? inventory.items : [];
+  const folders = Array.isArray(inventory.folders) ? inventory.folders : [];
+  const folderCatalogAvailable = inventory.folderCatalogAvailable === true;
+  const selectedFolderKey = inventory.selectedFolderKey || "";
+  const counts = new Map();
+  const folderIds = new Set(folders.filter((folder) => folder.source === "folder-catalog").map((folder) => String(folder.folderId || "").trim()).filter(Boolean));
+  const folderNames = new Map();
+  for (const item of items) {
+    const key = inventoryFolderKey(item);
+    if (key) {
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  for (const folder of folders) {
+    const name = String(folder.folderName || "").trim().toLowerCase();
+    if (name) {
+      const ids = folderNames.get(name) || new Set();
+      ids.add(String(folder.folderId || "").trim() || `name:${name}`);
+      folderNames.set(name, ids);
+    }
+  }
+  const duplicateFolderNames = [...folderNames.values()].filter((ids) => ids.size > 1).length;
+  const unassignedItems = items.filter((item) => !inventoryFolderKey(item));
+  const orphanItems = items.filter((item) => item.folderId && !folderIds.has(String(item.folderId).trim()));
+  const foldersWithValues = folders.filter((folder) => (counts.get(inventoryFolderKey(folder)) || 0) > 0).length;
+  const emptyFolders = folderCatalogAvailable ? folders.filter((folder) => (counts.get(inventoryFolderKey(folder)) || 0) === 0).length : 0;
+  const folderSummary = folders
+    .map((folder) => {
+      const key = inventoryFolderKey(folder);
+      const count = counts.get(key) || 0;
+      const warning = duplicateFolderNames && folder.folderName && [...folderNames.get(String(folder.folderName).trim().toLowerCase())].length > 1;
+      return `<button type="button" class="chip folder-chip ${selectedFolderKey === key ? "selected" : ""}" data-folder-key="${esc(key)}"><span>${esc(inventoryFolderLabel(folder))}</span><strong>${count}</strong><small>values</small>${warning ? `<em>Duplicate name</em>` : ""}${folder.folderId && !folder.folderName ? `<code>${esc(folder.folderId)}</code>` : ""}</button>`;
+    })
+    .join("");
+  const visibleItems = selectedFolderKey === "__unassigned__"
+    ? unassignedItems
+    : selectedFolderKey
+      ? items.filter((item) => inventoryFolderKey(item) === selectedFolderKey)
+      : items;
+
+  if (!els.customInventory) {
     return;
   }
 
-  const resource = state.resources[state.active];
-  const selectedCount = setFor(state.active).size;
-  const ready = state.deletable.includes(state.active);
-  els.deleteCategory.classList.toggle("hidden", !resource || !ready);
-  els.deleteCategory.disabled = !selectedCount;
-  els.deleteCategory.textContent = resource
-    ? `Delete selected ${resource.label.toLowerCase()} (${selectedCount})`
-    : "Delete selected category";
+  if (els.dashboardCustomValues) {
+    els.dashboardCustomValues.textContent = inventory.loaded ? String(items.length) : "-";
+  }
+  if (els.dashboardFolders) {
+    els.dashboardFolders.textContent = inventory.loaded ? (folderCatalogAvailable ? String(folders.length) : "Unknown") : "-";
+  }
+
+  if (inventory.error) {
+    els.customInventory.innerHTML = `<div class="empty">${esc(inventory.error)}</div>`;
+    els.customInventory.classList.remove("hidden");
+    return;
+  }
+
+  const visiblePage = pageSlice(visibleItems, "inventory");
+
+  els.customInventory.innerHTML = `
+    <div class="custom-values-inventory-summary">
+      <span>${esc(items.length)} values</span>
+      <span>${esc(folderCatalogAvailable ? folders.length : "Folder catalog unavailable")}</span>
+      <span>${esc(foldersWithValues)} with values</span>
+      <span>${esc(emptyFolders)} empty</span>
+      <span>${esc(unassignedItems.length)} unassigned</span>
+      ${orphanItems.length ? `<span class="inventory-warning">${esc(orphanItems.length)} orphan folder ID</span>` : ""}
+      ${duplicateFolderNames ? `<span class="inventory-warning">${esc(duplicateFolderNames)} duplicate folder name</span>` : ""}
+      ${!folderCatalogAvailable ? `<span class="inventory-warning">Folder names unavailable from API</span>` : ""}
+      <span>${inventory.verified ? "Verified readback" : "Unverified"}</span>
+    </div>
+    <div class="custom-values-folder-chips"><button type="button" class="chip folder-chip ${!selectedFolderKey ? "selected" : ""}" data-folder-key="">All values <strong>${items.length}</strong></button>${folderSummary}<button type="button" class="chip folder-chip ${selectedFolderKey === "__unassigned__" ? "selected" : ""}" data-folder-key="__unassigned__">Unassigned <strong>${unassignedItems.length}</strong></button></div>
+    <div class="table-head custom-values-head">
+      <span>Name</span><span>Value</span><span>Folder</span><span>Status</span><span>ID</span>
+    </div>
+    ${
+      visibleItems.length
+        ? visiblePage.items
+            .map(
+              (item) => {
+                const associated = Boolean(inventoryFolderKey(item));
+                const folderText = item.folderName || (item.folderId ? `Folder ID ${item.folderId}` : "Unassigned");
+                return `
+                <div class="table-row custom-values-row">
+                  <span class="item-name">${esc(item.name || "")}</span>
+                  <span>${esc(item.value || "")}</span>
+                  <span>${esc(folderText)}</span>
+                  <span class="badge ${associated ? "ready" : "incomplete"}">${associated ? "Foldered" : "Unassigned"}</span>
+                  <span><code>${esc(item.folderId || item.id || "")}</code></span>
+                </div>
+              `;
+              }
+            )
+            .join("")
+        : '<div class="empty">No custom values were returned for this location.</div>'
+    }
+    ${paginationMarkup("inventory", visibleItems.length, selectedFolderKey ? "filtered values" : "Custom Values")}
+  `;
+  els.customInventory.classList.remove("hidden");
+  els.customInventory.querySelectorAll("[data-folder-key]").forEach((button) => {
+    button.onclick = () => {
+      state.customValuesInventory.selectedFolderKey = button.dataset.folderKey || "";
+      state.pagination.inventory.page = 1;
+      renderCustomValuesInventoryPanel();
+    };
+  });
+  bindPagination(els.customInventory, "inventory", renderCustomValuesInventoryPanel);
 }
 
-async function scan() {
-  els.scan.disabled = els.rescan.disabled = true;
-  els.scanStatus.textContent = "Scanning through the API and audit engine…";
-  els.inventory.classList.remove("hidden");
+async function refreshCustomValuesInventory() {
+  const connection = currentConnection();
+  if (!connection || !selectedLocationId()) {
+    return;
+  }
 
+  if (state.loading.inventory) {
+    return;
+  }
+
+  state.loading.inventory = true;
+  setButtonLoading(els.refreshInventory, true, "Loading Custom Values…");
+  syncConnectionUI();
   try {
-    const response = await fetch("/api/scan", {
+    const response = await fetch("/api/custom-values/inventory", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
     const data = await response.json();
-
     if (!response.ok || !data.success) {
-      throw new Error(data.details || data.message || "Scan failed");
+      throw new Error(data.details || data.message || "Custom values inventory failed");
     }
 
-    state.resources = data.resources || {};
-    state.deletable = data.deletableCategories || [];
-    state.browserCategories = data.browserCategories || [];
-    state.location = data.location;
-    state.scanId = data.scanId;
-    state.selected.clear();
-    state.active = Object.keys(state.resources).find((key) => state.resources[key].count > 0) || Object.keys(state.resources)[0];
-
-    els.scanStatus.className = "message success";
-    els.scanStatus.textContent = data.allVerified
-      ? "Verified scan complete. Every deletable category is complete."
-      : "Scan finished, but some categories are incomplete. Deletion is blocked for those categories.";
-    els.danger.classList.remove("hidden");
-    tabs();
-    table();
-    metrics();
+    state.customValuesInventory = {
+      items: Array.isArray(data.items) ? data.items : [],
+      folders: Array.isArray(data.folders) ? data.folders : [],
+      folderCatalogAvailable: data.folderCatalogAvailable === true,
+      loaded: true,
+      verified: Boolean(data.verified),
+      error: "",
+      selectedFolderKey: "",
+    };
+    state.pagination.inventory.page = 1;
   } catch (error) {
-    els.scanStatus.className = "message error";
-    els.scanStatus.textContent = error.message;
+    state.customValuesInventory = {
+      items: [],
+      folders: [],
+      folderCatalogAvailable: false,
+      loaded: false,
+      verified: false,
+      error: error.message,
+    };
   } finally {
-    els.scan.disabled = els.rescan.disabled = false;
+    state.loading.inventory = false;
+    setButtonLoading(els.refreshInventory, false);
+    syncConnectionUI();
   }
+
+  renderCustomValuesInventoryPanel();
 }
 
 function customValueRows() {
@@ -379,112 +588,33 @@ function readCustomValues() {
   return { rows, values, hasPartialRow };
 }
 
-function renderCustomValuesResult({ created = 0, updated = 0, unchanged = 0, failed = 0, folderAssociationVerified = false, note = "" }) {
-  els.customResult.className = "message success";
-  els.customResult.innerHTML = `
-    <div class="custom-values-summary">
-      <strong>Custom Values</strong>
-      <span>Created: ${esc(created)}</span>
-      <span>Updated: ${esc(updated)}</span>
-      <span>Skipped: ${esc(unchanged)}</span>
-      <span>Failed: ${esc(failed)}</span>
-      <span>Folder Association Verified: ${folderAssociationVerified ? "Yes" : "No"}</span>
-      ${note ? `<small>${esc(note)}</small>` : ""}
-    </div>
-  `;
-  els.customResult.classList.remove("hidden");
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 }
 
-function renderCustomValuesError(text) {
-  els.customResult.className = "message error";
-  els.customResult.textContent = text;
-  els.customResult.classList.remove("hidden");
-}
-
-function renderCustomValuesInventoryPanel() {
-  const inventory = state.customValuesInventory || {};
-  const items = Array.isArray(inventory.items) ? inventory.items : [];
-  const folders = Array.isArray(inventory.folders) ? inventory.folders : [];
-  const folderSummary = folders
-    .map(
-      (folder) =>
-        `<span class="chip">${esc(folder.folderName || "")}${folder.folderId ? ` <code>${esc(folder.folderId)}</code>` : ""}</span>`
-    )
-    .join("");
-
-  if (!els.customInventory) {
-    return;
+async function readFilePayload(file) {
+  if (!file) {
+    return null;
   }
 
-  if (inventory.error) {
-    els.customInventory.innerHTML = `<div class="empty">${esc(inventory.error)}</div>`;
-    els.customInventory.classList.remove("hidden");
-    return;
-  }
+  const text = await file.text();
+  const base64 = file.type.includes("sheet") || /\.xlsx?$/i.test(file.name)
+    ? arrayBufferToBase64(await file.arrayBuffer())
+    : "";
 
-  els.customInventory.innerHTML = `
-    <div class="custom-values-inventory-summary">
-      <span>${esc(items.length)} values</span>
-      <span>${esc(folders.length)} folders</span>
-    </div>
-    ${folders.length ? `<div class="custom-values-folder-chips">${folderSummary}</div>` : ""}
-    <div class="table-head custom-values-head">
-      <span>Name</span><span>Value</span><span>Folder</span><span>Status</span><span>ID</span>
-    </div>
-    ${
-      items.length
-        ? items
-            .map(
-              (item) => `
-                <div class="table-row custom-values-row">
-                  <span class="item-name">${esc(item.name || "")}</span>
-                  <span>${esc(item.value || "")}</span>
-                  <span>${esc(item.folderName || "")}</span>
-                  <span class="badge ${item.folderName ? "ready" : "incomplete"}">${item.folderName ? "Foldered" : "Unfiled"}</span>
-                  <span><code>${esc(item.folderId || item.id || "")}</code></span>
-                </div>
-              `
-            )
-            .join("")
-        : '<div class="empty">No custom values were returned for this location.</div>'
-    }
-  `;
-  els.customInventory.classList.remove("hidden");
-}
-
-async function refreshCustomValuesInventory() {
-  const connection = currentConnection();
-  if (!connection || !selectedLocationId()) {
-    return;
-  }
-
-  try {
-    const response = await fetch("/api/custom-values/inventory", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    const data = await response.json();
-    if (!response.ok || !data.success) {
-      throw new Error(data.details || data.message || "Custom values inventory failed");
-    }
-
-    state.customValuesInventory = {
-      items: Array.isArray(data.items) ? data.items : [],
-      folders: Array.isArray(data.folders) ? data.folders : [],
-      loaded: true,
-      error: "",
-    };
-  } catch (error) {
-    state.customValuesInventory = {
-      items: [],
-      folders: [],
-      loaded: false,
-      error: error.message,
-    };
-  }
-
-  renderCustomValuesInventoryPanel();
+  return {
+    fileName: file.name,
+    fileType: file.type,
+    fileText: text,
+    fileBase64: base64,
+  };
 }
 
 function renderCustomValuesPreview(previewResult) {
@@ -498,6 +628,7 @@ function renderCustomValuesPreview(previewResult) {
   }
 
   const rows = Array.isArray(previewResult.preview) ? previewResult.preview : [];
+  const page = pageSlice(rows, "preview");
   const counts = previewResult.counts || {};
   const summary = `
     <div class="custom-values-summary">
@@ -520,10 +651,11 @@ function renderCustomValuesPreview(previewResult) {
         <span>Imported Value</span>
         <span>Existing Folder</span>
         <span>Target Folder</span>
+        <span>Folder Status</span>
       </div>
       ${
         rows.length
-          ? rows
+          ? page.items
               .map(
                 (row) => `
                   <div class="table-row custom-values-preview-row ${esc(row.action || "")}">
@@ -533,6 +665,7 @@ function renderCustomValuesPreview(previewResult) {
                     <span>${esc(row.importedValue || "")}</span>
                     <span>${esc(row.existingFolder || "")}</span>
                     <span>${esc(row.targetFolder || "")}</span>
+                    <span class="badge ${esc(String(row.folderStatus || "").toLowerCase())}">${esc(row.folderStatus || "")}</span>
                   </div>
                 `
               )
@@ -540,150 +673,283 @@ function renderCustomValuesPreview(previewResult) {
           : '<div class="empty">No rows to preview.</div>'
       }
     </div>
+    ${paginationMarkup("preview", rows.length, "preview rows")}
   `;
   els.customPreviewWrap.classList.remove("hidden");
   els.customConfirm.disabled = !(previewResult && rows.length);
+  bindPagination(els.customPreviewWrap, "preview", () => renderCustomValuesPreview(state.customValuesImport.preview));
 }
 
-function customValuesTableRows(resource) {
-  const rows = Array.isArray(resource?.items) ? resource.items : [];
-  if (state.active !== "customValues") {
-    return rows;
-  }
-  return rows;
-}
-
-function renderCustomValuesInventory(resource) {
-  if (!resource) {
-    return;
-  }
-
-  if (state.active !== "customValues") {
-    return;
-  }
-
-  const list = customValuesTableRows(resource);
-  const ready = resource.verified === true;
-  const statusText = ready
-    ? `Verified ${resource.loadedCount}/${resource.reportedTotal ?? resource.loadedCount}`
-    : `Incomplete ${resource.loadedCount || 0}/${resource.reportedTotal ?? "?"}`;
-
-  els.table.innerHTML = `
-    <div class="scan-proof ${ready ? "verified" : "incomplete"}">
-      <strong>${esc(statusText)}</strong>
-      ${resource.error ? `<span>${esc(resource.error)}</span>` : ""}
-    </div>
-    <div class="table-head custom-values-head">
-      <span></span><span>Name</span><span>Value</span><span>Folder</span><span>Status</span>
-    </div>
-    ${
-      list.length
-        ? list
-            .map(
-              (item) => `
-                <label class="table-row custom-values-row">
-                  <input type="checkbox" data-id="${esc(item.id)}" ${ready ? "" : "disabled"} ${
-                setFor(state.active).has(item.id) ? "checked" : ""
-              }>
-                  <span class="item-name">${esc(item.name)}</span>
-                  <span>${esc(item.value || "")}</span>
-                  <span>${esc(item.folderName || "")}</span>
-                  <span class="badge ${ready ? "ready" : ""}">${ready ? "Verified" : "Deletion blocked"}</span>
-                </label>
-              `
-            )
-            .join("")
-        : '<div class="empty">No matching items.</div>'
-    }`;
-
-  els.table.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-    checkbox.onchange = () => {
-      if (checkbox.checked) {
-        setFor(state.active).add(checkbox.dataset.id);
-      } else {
-        setFor(state.active).delete(checkbox.dataset.id);
-      }
-      metrics();
-    };
-  });
-  categoryButton();
-}
-
-function currentConnection() {
-  return state.connection || null;
-}
-
-function selectedLocationId() {
-  return String(state.connection?.selectedLocationId || state.connection?.locationId || "").trim();
-}
-
-function canOperate() {
-  return Boolean(currentConnection() && selectedLocationId());
-}
-
-function syncConnectionUI() {
+async function previewCustomValuesImport() {
   const connection = currentConnection();
-  const selected = connection?.selectedLocation || null;
-  const connected = Boolean(connection);
-  const ready = Boolean(connection && selectedLocationId());
-  const displayLocationId = selected?.id || connection?.selectedLocationId || (connected ? "Select a location" : "-");
+  const locationId = selectedLocationId();
+  const folderName = els.customFolder.value.trim();
+  const file = els.customImportFile.files?.[0] || null;
+  const fileMode = Boolean(file);
 
-  els.account.classList.toggle("hidden", !connected);
-  els.accountName.textContent = connection?.accountName || connection?.companyName || "Not connected";
-  els.accountLocation.textContent = displayLocationId;
-  els.accountInline.textContent = connection?.accountName || connection?.companyName || "Not connected";
-  els.selectedLocationInline.textContent = selected?.name || connection?.selectedLocationName || "None";
-  els.selectedLocationIdInline.textContent = selected?.id || connection?.selectedLocationId || (connected ? "Select a location" : "-");
-  els.topStatus.textContent = ready ? "Connected" : connected ? "Location needed" : "Not connected";
-  els.scan.disabled = !ready;
-  els.refreshLocations.disabled = !connected;
-  els.changeLocation.disabled = !connected;
-  els.disconnect.disabled = !connected;
-  els.test.disabled = false;
-  els.customPreview.disabled = !ready;
-  els.customConfirm.disabled = !ready || !state.customValuesImport.preview;
-  els.customSubmit.disabled = !ready;
-  els.customAdd.disabled = !ready;
-  els.customImportFile.disabled = !ready;
-  els.customFolder.disabled = !ready;
-  els.selectFiltered.disabled = !ready;
-  els.clearCategory.disabled = !ready;
-  els.deleteCategory.disabled = !ready || !state.active;
-  els.deleteSelected.disabled = !ready;
-  els.deleteAll.disabled = !ready;
-  els.rescan.disabled = !ready;
-}
-
-function renderConnectionLocations(locations = []) {
-  if (!Array.isArray(locations) || !locations.length) {
-    els.locations.innerHTML = '<div class="empty">No locations discovered yet.</div>';
-    els.locations.classList.remove("hidden");
+  if (!connection || !locationId) {
+    renderCustomValuesError("Connect the account before previewing Custom Value imports.");
     return;
   }
 
-  const selectedId = selectedLocationId();
-  els.locations.innerHTML = `
-    <div class="connection-locations-head">
-      <strong>Available Locations</strong>
-      <span>${locations.length} discovered</span>
-    </div>
-    <div class="connection-location-list">
-      ${locations
-        .map(
-          (location) => `
-            <button type="button" class="connection-location ${String(location.id || "") === selectedId ? "selected" : ""}" data-location-id="${esc(location.id || "")}">
-              <span>${esc(location.name || "")}</span>
-              <code>${esc(location.id || "")}</code>
-            </button>
-          `
-        )
-        .join("")}
-    </div>
-  `;
-  els.locations.classList.remove("hidden");
-  els.locations.querySelectorAll("[data-location-id]").forEach((button) => {
-    button.onclick = () => selectLocation(button.dataset.locationId);
+  if (!file) {
+    renderCustomValuesError("Choose a CSV or XLSX file to preview.");
+    return;
+  }
+
+  if (state.loading.preview) {
+    return;
+  }
+  state.loading.preview = true;
+  setButtonLoading(els.customPreview, true, "Reading file and comparing…");
+  showInlineLoading(els.customResult, "Reading file and comparing…");
+  syncConnectionUI();
+
+  try {
+    const payload = await readFilePayload(file);
+    const response = await fetch("/api/custom-values/import-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...payload,
+        targetFolderName: fileMode ? "" : folderName,
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.details || data.message || "Custom values preview failed");
+    }
+
+    state.customValuesImport.file = payload;
+    state.customValuesImport.preview = data;
+    state.pagination.preview.page = 1;
+    if (els.customFileName) {
+      els.customFileName.textContent = `${file.name} - ${Array.isArray(data.preview) ? data.preview.length : 0} rows`;
+    }
+    if (els.dashboardLastImport) {
+      els.dashboardLastImport.textContent = "Preview ready";
+    }
+    renderCustomValuesPreview(data);
+    renderCustomValuesResult({
+      title: "Import Preview",
+      created: data.counts?.create || 0,
+      updated: data.counts?.update || 0,
+      unchanged: data.counts?.unchanged || 0,
+      failed: (data.counts?.conflict || 0) + (data.counts?.invalid || 0),
+      folderAssociationVerified: false,
+      note: fileMode ? "Preview ready. File rows are authoritative." : "Preview ready.",
+    });
+  } catch (error) {
+    renderCustomValuesError(error.message);
+  } finally {
+    state.loading.preview = false;
+    setButtonLoading(els.customPreview, false);
+    syncConnectionUI();
+  }
+}
+
+async function confirmCustomValuesImport() {
+  const connection = currentConnection();
+  const locationId = selectedLocationId();
+  const folderName = els.customFolder.value.trim();
+  const file = state.customValuesImport.file || null;
+  const preview = state.customValuesImport.preview || null;
+  const fileMode = Boolean(file);
+
+  if (!connection || !locationId) {
+    renderCustomValuesError("Connect the account before importing Custom Values.");
+    return;
+  }
+
+  if (!file || !preview) {
+    renderCustomValuesError("Preview the import before confirming it.");
+    return;
+  }
+
+  if (state.loading.import) {
+    return;
+  }
+  state.loading.import = true;
+  setButtonLoading(els.customConfirm, true, "Creating and updating Custom Values…");
+  showInlineLoading(els.customResult, "Creating and updating Custom Values…");
+  syncConnectionUI();
+
+  try {
+    const response = await fetch("/api/custom-values/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...file,
+        targetFolderName: fileMode ? "" : folderName,
+        mode: "execute",
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.details || data.message || "Custom values import failed");
+    }
+
+    if (!data.success && !hasImportSummary(data)) {
+      throw new Error(data.details || data.message || "Custom values import failed");
+    }
+
+    const created = Number(data.created || 0);
+    const updated = Number(data.updated || 0);
+    const unchanged = Number(data.unchanged || 0);
+    const failed = Number(data.failed || 0);
+    const partial = failed > 0 || data.success === false;
+
+    showInlineLoading(els.customResult, "Verifying changes…");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (els.dashboardLastImport) {
+      els.dashboardLastImport.textContent = "Complete";
+    }
+    renderCustomValuesResult({
+      title: partial ? "Import completed with issues" : "Import Complete",
+      tone: partial ? "warning" : "success",
+      created,
+      updated,
+      unchanged,
+      failed,
+      folderAssociationVerified: Boolean(data.folderAssociationVerified),
+      note: data.error || (partial ? "Some rows need attention." : ""),
+      rows: Array.isArray(data.verificationFailures) ? data.verificationFailures : [],
+    });
+    if (els.dashboardLastImport) {
+      els.dashboardLastImport.textContent = "Complete";
+    }
+    state.customValuesImport.file = null;
+    state.customValuesImport.preview = null;
+    els.customImportFile.value = "";
+    renderCustomValuesPreview(null);
+    await refreshCustomValuesInventory();
+  } catch (error) {
+    renderCustomValuesError(error.message);
+  } finally {
+    state.loading.import = false;
+    setButtonLoading(els.customConfirm, false);
+    syncConnectionUI();
+  }
+}
+
+async function submitCustomValues(event) {
+  event.preventDefault();
+
+  if (state.loading.import) {
+    return;
+  }
+
+  const connection = currentConnection();
+  const locationId = selectedLocationId();
+  const folderName = els.customFolder.value.trim();
+  const file = els.customImportFile.files?.[0] || state.customValuesImport.file || null;
+  const { values, hasPartialRow } = readCustomValues();
+
+  if (file) {
+    renderCustomValuesError("Use Preview import and Confirm import for CSV/XLSX uploads.");
+    return;
+  }
+
+  if (!connection || !locationId) {
+    renderCustomValuesError("Connect the account before setting up Custom Values.");
+    return;
+  }
+
+  if (hasPartialRow) {
+    renderCustomValuesError("Each Custom Value row must include both a Name and a Value.");
+    return;
+  }
+
+  if (!folderName && values.length) {
+    renderCustomValuesError("Folder Name is required when Custom Values are provided.");
+    return;
+  }
+
+  if (!folderName && !values.length) {
+    renderCustomValuesResult({
+      title: "Custom Values",
+      created: 0,
+      updated: 0,
+      unchanged: 0,
+      failed: 0,
+      folderAssociationVerified: false,
+      note: "No Custom Values were provided.",
+    });
+    return;
+  }
+
+  if (folderName && !values.length) {
+    renderCustomValuesResult({
+      title: "Custom Values",
+      created: 0,
+      updated: 0,
+      unchanged: 0,
+      failed: 0,
+      folderAssociationVerified: false,
+      note: "No Custom Values were provided.",
+    });
+    return;
+  }
+
+  const customControls = [els.customSubmit, els.customAdd].filter(Boolean);
+  state.loading.import = true;
+  setButtonLoading(els.customSubmit, true, "Creating and updating Custom Values…");
+  customControls.forEach((control) => {
+    control.disabled = true;
   });
+  syncConnectionUI();
+
+  try {
+    const response = await fetch("/api/custom-values/ensure", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customValueFolderName: folderName,
+        customValues: values,
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.details || data.message || "Custom Values setup failed");
+    }
+
+    if (!data.success && !hasImportSummary(data)) {
+      throw new Error(data.details || data.message || "Custom Values setup failed");
+    }
+
+    const created = Number(data.created || 0);
+    const updated = Number(data.updated || 0);
+    const existing = Number(data.unchanged || data.skipped || 0);
+    const failed = Number(data.failed || 0) + (data.folderStatus === "failed" ? 1 : 0);
+    const partial = failed > 0 || data.success === false;
+
+    renderCustomValuesResult({
+      title: partial ? "Custom Values Applied with issues" : "Custom Values Applied",
+      tone: partial ? "warning" : "success",
+      created,
+      updated,
+      unchanged: existing,
+      failed,
+      folderAssociationVerified: Boolean(data.folderAssociationVerified && data.folderStatus !== "failed"),
+      note: data.message || (partial ? "Some rows need attention." : ""),
+    });
+    if (els.dashboardLastImport) {
+      els.dashboardLastImport.textContent = "Complete";
+    }
+    await refreshCustomValuesInventory();
+  } catch (error) {
+    renderCustomValuesError(error.message);
+  } finally {
+    state.loading.import = false;
+    setButtonLoading(els.customSubmit, false);
+    customControls.forEach((control) => {
+      control.disabled = false;
+    });
+    syncConnectionUI();
+  }
 }
 
 function applyConnection(connection, options = {}) {
@@ -692,6 +958,7 @@ function applyConnection(connection, options = {}) {
     els.account.classList.remove("hidden");
     els.accountName.textContent = connection.accountName || connection.companyName || "Connected GHL Account";
     els.accountLocation.textContent = connection.selectedLocationId || "-";
+    els.locationId.value = connection.selectedLocationId || connection.locationId || "";
     renderConnectionLocations(connection.locations || []);
   } else {
     els.locations.classList.add("hidden");
@@ -702,17 +969,23 @@ function applyConnection(connection, options = {}) {
     els.accountInline.textContent = "Not connected";
     els.selectedLocationInline.textContent = "None";
     els.selectedLocationIdInline.textContent = "-";
-    state.customValuesImport.preview = null;
-    state.customValuesImport.file = null;
-    renderCustomValuesPreview(null);
+    els.token.value = "";
+    els.token.type = "password";
+    els.toggle.textContent = "Show";
+    els.locationId.value = "";
+    resetFileImportState();
+    state.pagination.inventory.page = 1;
     state.customValuesInventory = {
       items: [],
       folders: [],
+      folderCatalogAvailable: false,
       loaded: false,
+      verified: false,
       error: "",
     };
     renderCustomValuesInventoryPanel();
   }
+
   if (!options.silent) {
     syncConnectionUI();
   } else {
@@ -729,11 +1002,8 @@ async function loadConnection() {
     const data = await response.json();
     if (response.ok && data.success && data.connected && data.connection) {
       applyConnection(data.connection, { silent: true });
-      if (!selectedLocationId()) {
-        renderConnectionLocations(data.connection.locations || []);
-      }
       if (selectedLocationId()) {
-        refreshCustomValuesInventory();
+        await refreshCustomValuesInventory();
       }
     } else {
       applyConnection(null, { silent: true });
@@ -783,7 +1053,7 @@ async function selectLocation(locationId) {
     const nextConnection = data.connection || connection;
     applyConnection(nextConnection, { silent: true });
     msg(`Connected location: ${data.selectedLocation?.name || locationId}`, "success");
-    refreshCustomValuesInventory();
+    await refreshCustomValuesInventory();
     syncConnectionUI();
   } catch (error) {
     msg(error.message, "error");
@@ -791,6 +1061,14 @@ async function selectLocation(locationId) {
 }
 
 async function disconnectConnection() {
+  if (state.loading.disconnect) {
+    return;
+  }
+
+  state.loading.disconnect = true;
+  setButtonLoading(els.disconnect, true, "Disconnecting…");
+  syncConnectionUI();
+
   try {
     const response = await fetch("/api/connection/disconnect", {
       method: "POST",
@@ -801,401 +1079,25 @@ async function disconnectConnection() {
       throw new Error(data.details || data.message || "Disconnect failed");
     }
     applyConnection(null, { silent: true });
-    renderCustomValuesInventoryPanel();
     msg("Disconnected.", "success");
     syncConnectionUI();
   } catch (error) {
     msg(error.message, "error");
-  }
-}
-
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
-}
-
-async function readFilePayload(file) {
-  if (!file) {
-    return null;
-  }
-
-  const text = await file.text();
-  const base64 = file.type.includes("sheet") || /\.xlsx?$/i.test(file.name)
-    ? arrayBufferToBase64(await file.arrayBuffer())
-    : "";
-
-  return {
-    fileName: file.name,
-    fileType: file.type,
-    fileText: text,
-    fileBase64: base64,
-  };
-}
-
-async function previewCustomValuesImport() {
-  const connection = currentConnection();
-  const locationId = selectedLocationId();
-  const folderName = els.customFolder.value.trim();
-  const file = els.customImportFile.files?.[0] || null;
-
-  if (!connection || !locationId) {
-    renderCustomValuesError("Connect the account before previewing Custom Value imports.");
-    return;
-  }
-
-  if (!file) {
-    renderCustomValuesError("Choose a CSV or XLSX file to preview.");
-    return;
-  }
-
-  els.customPreview.classList.add("loading");
-  els.customPreview.disabled = true;
-
-  try {
-    const payload = await readFilePayload(file);
-    const response = await fetch("/api/custom-values/import-preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        targetFolderName: folderName,
-        ...payload,
-      }),
-    });
-
-    const data = await response.json();
-    if (!response.ok || !data.success) {
-      throw new Error(data.details || data.message || "Custom values preview failed");
-    }
-
-    state.customValuesImport.file = payload;
-    state.customValuesImport.preview = data;
-    renderCustomValuesPreview(data);
-    renderCustomValuesResult({
-      created: data.counts?.create || 0,
-      updated: data.counts?.update || 0,
-      unchanged: data.counts?.unchanged || 0,
-      failed: (data.counts?.conflict || 0) + (data.counts?.invalid || 0),
-      folderAssociationVerified: false,
-      note: "Preview ready.",
-    });
-  } catch (error) {
-    renderCustomValuesError(error.message);
   } finally {
-    els.customPreview.classList.remove("loading");
-    els.customPreview.disabled = false;
+    state.loading.disconnect = false;
+    setButtonLoading(els.disconnect, false);
+    syncConnectionUI();
   }
 }
 
-async function confirmCustomValuesImport() {
-  const connection = currentConnection();
-  const locationId = selectedLocationId();
-  const folderName = els.customFolder.value.trim();
-  const file = state.customValuesImport.file || null;
-  const preview = state.customValuesImport.preview || null;
-
-  if (!connection || !locationId) {
-    renderCustomValuesError("Connect the account before importing Custom Values.");
-    return;
-  }
-
-  if (!file || !preview) {
-    renderCustomValuesError("Preview the import before confirming it.");
-    return;
-  }
-
-  els.customConfirm.disabled = true;
-
-  try {
-    const response = await fetch("/api/custom-values/import", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        targetFolderName: folderName,
-        ...file,
-        mode: "execute",
-      }),
-    });
-
-    const data = await response.json();
-    if (!response.ok || !data.success) {
-      throw new Error(data.details || data.message || "Custom values import failed");
-    }
-
-    renderCustomValuesResult({
-      created: Number(data.created || 0),
-      updated: Number(data.updated || 0),
-      unchanged: Number(data.unchanged || 0),
-      failed: Number(data.failed || 0),
-      folderAssociationVerified: Boolean(data.folderAssociationVerified),
-      note: data.error || "",
-    });
-    state.customValuesImport.file = null;
-    state.customValuesImport.preview = null;
-    renderCustomValuesPreview(null);
-    refreshCustomValuesInventory();
-    await scan();
-  } catch (error) {
-    renderCustomValuesError(error.message);
-  } finally {
-    els.customConfirm.disabled = false;
-  }
-}
-
-async function submitCustomValues(event) {
+async function handleConnectionConnect(event) {
   event.preventDefault();
-
-  const connection = currentConnection();
-  const locationId = selectedLocationId();
-  const folderName = els.customFolder.value.trim();
-  const { values, hasPartialRow } = readCustomValues();
-
-  if (!connection || !locationId) {
-    renderCustomValuesError("Connect the account before setting up Custom Values.");
+  if (state.loading.connect) {
     return;
   }
-
-  if (hasPartialRow) {
-    renderCustomValuesError("Each Custom Value row must include both a Name and a Value.");
-    return;
-  }
-
-  if (!folderName && values.length) {
-    renderCustomValuesError("Folder Name is required when Custom Values are provided.");
-    return;
-  }
-
-  if (!folderName && !values.length) {
-    renderCustomValuesResult({ created: 0, updated: 0, unchanged: 0, failed: 0, folderAssociationVerified: false, note: "No Custom Values were provided." });
-    return;
-  }
-
-  if (folderName && !values.length) {
-    renderCustomValuesResult({ created: 0, updated: 0, unchanged: 0, failed: 0, folderAssociationVerified: false, note: "No Custom Values were provided." });
-    return;
-  }
-
-  const customControls = [els.customSubmit, els.customAdd].filter(Boolean);
-  customControls.forEach((control) => {
-    control.disabled = true;
-  });
-
-  try {
-    const response = await fetch("/api/custom-values/ensure", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        customValueFolderName: folderName,
-        customValues: values,
-      }),
-    });
-
-    const data = await response.json();
-    if (!response.ok || !data.success) {
-      throw new Error(data.details || data.message || "Custom Values setup failed");
-    }
-
-    const created = Array.isArray(data.values)
-      ? data.values.filter((item) => item.status === "created").length
-      : Number(data.created || 0);
-    const existing = Array.isArray(data.values)
-      ? data.values.filter((item) => item.status === "existing" || item.status === "skipped").length
-      : Number(data.skipped || 0);
-    const failed = Array.isArray(data.values)
-      ? data.values.filter((item) => item.status === "failed").length + (data.folderStatus === "failed" ? 1 : 0)
-      : Number(data.failed || 0) + (data.folderStatus === "failed" ? 1 : 0);
-
-    renderCustomValuesResult({
-      created,
-      updated: 0,
-      unchanged: existing,
-      failed,
-      folderAssociationVerified: Boolean(data.folderStatus && data.folderStatus !== "failed"),
-      note: data.message || "",
-    });
-    refreshCustomValuesInventory();
-  } catch (error) {
-    renderCustomValuesError(error.message);
-  } finally {
-    customControls.forEach((control) => {
-      control.disabled = false;
-    });
-  }
-}
-
-function review(url, body, title, description, rows) {
-  els.modalContent.innerHTML = `
-    <h2>${esc(title)}</h2>
-    <p>${esc(description)}</p>
-    <div class="modal-list">${rows.map((value) => `<div>${esc(value)}</div>`).join("")}</div>
-    <div id="delete-progress"></div>
-    <div class="modal-actions">
-      <button class="ghost" id="cancel-delete">Cancel</button>
-      <button class="danger" id="confirm-delete">Delete selected</button>
-    </div>
-  `;
-  els.modal.classList.remove("hidden");
-  $("cancel-delete").onclick = () => els.modal.classList.add("hidden");
-  $("confirm-delete").onclick = () => perform(url, body);
-}
-
-function showCategory() {
-  const category = state.active;
-  const selectedPayload = payload();
-  const list = selectedPayload[category] || [];
-  const resource = state.resources[category];
-
-  review(
-    "/api/delete-category",
-    { scanId: state.scanId, category, selections: selectedPayload },
-    `Delete ${list.length} selected ${resource.label.toLowerCase()}?`,
-    state.browserCategories.includes(category)
-      ? `Only the dedicated ${category} browser will open.`
-      : "These items will be deleted through the API.",
-    list.map((item) => item.resourceName || item.name)
-  );
-}
-
-function showSelected() {
-  const selectedPayload = payload();
-  const list = Object.entries(selectedPayload).flatMap(([category, entries]) =>
-    entries.map((item) => `${state.resources[category]?.label || category} — ${item.resourceName || item.name}`)
-  );
-
-  review(
-    "/api/delete-selected",
-    { scanId: state.scanId, selections: selectedPayload },
-    `Delete ${list.length} selected item${list.length === 1 ? "" : "s"}?`,
-    "API items use the key. For 1–9 browser items, exact search is used. For 10 or more, one A–Z pass is used.",
-    list
-  );
-}
-
-function showAll() {
-  const categories = ["tags", "customFields", "customValues", "triggerLinks", "workflows", "funnels", "forms"].filter(
-    (category) => state.resources[category]
-  );
-
-  els.modalContent.innerHTML = `
-    <h2>Delete everything supported?</h2>
-    <p>Choose categories. Selecting Workflows, Funnels, or Forms deletes every item currently inside that GHL category.</p>
-    <div class="category-choice-list">
-      ${categories
-        .map((category) => {
-          const resource = state.resources[category];
-          const disabled = !Number(resource.count || 0);
-          return `
-            <label class="category-choice ${disabled ? "disabled" : ""}">
-              <input type="checkbox" class="delete-all-category" value="${esc(category)}" ${disabled ? "disabled" : "checked"}>
-              <span>
-                <strong>${esc(resource.label)}</strong>
-                <small>${resource.count} found · ${state.browserCategories.includes(category) ? "dedicated browser" : "API"}</small>
-              </span>
-            </label>
-          `;
-        })
-        .join("")}
-    </div>
-    <label>Type <strong>DELETE EVERYTHING</strong></label>
-    <input id="delete-all-confirm" class="confirm-input" autocomplete="off">
-    <div id="delete-progress"></div>
-    <div class="modal-actions">
-      <button class="ghost" id="cancel-delete">Cancel</button>
-      <button class="danger" id="confirm-delete-all" disabled>Delete chosen categories</button>
-    </div>
-  `;
-  els.modal.classList.remove("hidden");
-  const confirm = $("delete-all-confirm");
-  const button = $("confirm-delete-all");
-  confirm.oninput = () => {
-    button.disabled = confirm.value !== "DELETE EVERYTHING";
-  };
-  $("cancel-delete").onclick = () => els.modal.classList.add("hidden");
-  button.onclick = () =>
-    perform("/api/delete-all", {
-      scanId: state.scanId,
-      confirmation: confirm.value,
-      categories: [...els.modalContent.querySelectorAll(".delete-all-category:checked")].map((input) => input.value),
-      scanCounts: counts(),
-    });
-}
-
-async function perform(url, body) {
-  const progress = $("delete-progress");
-  progress.className = "message";
-  progress.textContent =
-    "Cleanup started. API items use the key. Browser categories open directly in separate Chromium windows.";
-  els.modalContent.querySelectorAll("button").forEach((button) => {
-    button.disabled = true;
-  });
-
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await response.json();
-
-    if (!response.ok || !data.success) {
-      throw new Error(data.details || data.message || "Deletion failed");
-    }
-
-    progress.className = "message success";
-    progress.innerHTML = `
-      Deleted <strong>${data.deleted}</strong>. Failed <strong>${data.failed}</strong>. Skipped <strong>${data.skipped || 0}</strong>.
-      <div class="modal-list">
-        ${(data.results || [])
-          .map(
-              (result) => `
-              <div class="result-row ${esc(result.status)}">
-                <span>${esc(result.status)}</span>
-                <strong>${esc(result.resourceName || result.name || result.category)}</strong>
-                ${result.error ? `<small>${esc(result.error)}</small>` : ""}
-              </div>
-            `
-          )
-          .join("")}
-      </div>
-      <button id="scan-again" class="primary">Scan again</button>
-    `;
-    $("scan-again").onclick = () => {
-      els.modal.classList.add("hidden");
-      scan();
-    };
-  } catch (error) {
-    progress.className = "message error";
-    progress.textContent = error.message;
-  }
-}
-
-function initCustomValuesSection() {
-  addCustomValueRow();
-  els.customAdd.onclick = () => addCustomValueRow();
-  els.customPreview.onclick = () => previewCustomValuesImport();
-  els.customConfirm.onclick = () => confirmCustomValuesImport();
-  els.customImportFile.onchange = () => {
-    state.customValuesImport.file = null;
-    state.customValuesImport.preview = null;
-    renderCustomValuesPreview(null);
-  };
-  els.customForm.onsubmit = submitCustomValues;
-}
-
-els.toggle.onclick = () => {
-  const hidden = els.token.type === "password";
-  els.token.type = hidden ? "text" : "password";
-  els.toggle.textContent = hidden ? "Hide" : "Show";
-};
-
-els.form.onsubmit = async (event) => {
-  event.preventDefault();
   const token = els.token.value.trim();
+  const locationId = els.locationId.value.trim();
+
   if (looksLikeLocationId(token)) {
     msg("This looks like a Location ID, not an Integration Token.", "error");
     return;
@@ -1204,14 +1106,25 @@ els.form.onsubmit = async (event) => {
     msg("That GHL token is invalid. Paste a valid Private Integration Token.", "error");
     return;
   }
-  els.test.disabled = true;
+  if (!locationId) {
+    msg("GHL Location ID is required.", "error");
+    return;
+  }
+  if (looksLikePrivateIntegrationToken(locationId)) {
+    msg("This looks like a token, not a Location ID.", "error");
+    return;
+  }
+
+  state.loading.connect = true;
+  setButtonLoading(els.test, true, "Connecting…");
+  syncConnectionUI();
   msg("Connecting…");
 
   try {
     const response = await fetch("/api/connection/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, mode: "development-token" }),
+      body: JSON.stringify({ token, locationId, mode: "manual-token-location" }),
     });
     const data = await response.json();
 
@@ -1223,64 +1136,70 @@ els.form.onsubmit = async (event) => {
       accountName: data.accountName || data.companyName || "Connected GHL Account",
       companyName: data.companyName || "",
       locations: data.locations || [],
-      selectedLocationId: "",
-      selectedLocation: null,
+      selectedLocationId: data.selectedLocation?.id || locationId,
+      selectedLocation: data.selectedLocation || { id: locationId, name: "Selected GHL Location" },
     }, { silent: true });
     renderConnectionLocations(data.locations || []);
     els.accountName.textContent = data.accountName || data.companyName || "Connected GHL Account";
-    els.accountLocation.textContent = data.connection?.selectedLocationId || "Select a location";
+    els.accountLocation.textContent = data.connection?.selectedLocationId || data.selectedLocation?.id || locationId;
     els.account.classList.remove("hidden");
-    els.topStatus.textContent = "Connected";
+    els.topStatus.innerHTML = '<span class="status-dot"></span>Connected';
     els.token.value = "";
     els.token.type = "password";
     els.toggle.textContent = "Show";
     msg("Connection successful.", "success");
+    await refreshCustomValuesInventory();
     syncConnectionUI();
   } catch (error) {
     msg(error.message, "error");
   } finally {
-    els.test.disabled = false;
+    state.loading.connect = false;
+    setButtonLoading(els.test, false);
+    syncConnectionUI();
   }
+}
+
+function initCustomValuesSection() {
+  addCustomValueRow();
+  els.customAdd.onclick = () => addCustomValueRow();
+  els.customPreview.onclick = () => previewCustomValuesImport();
+  els.customConfirm.onclick = () => confirmCustomValuesImport();
+  els.customImportFile.onchange = () => {
+    resetFileImportState();
+    const file = els.customImportFile.files?.[0] || null;
+    if (file && els.customFileName) {
+      els.customFileName.textContent = file.name;
+    }
+  };
+  els.customForm.onsubmit = submitCustomValues;
+}
+
+els.toggle.onclick = () => {
+  const hidden = els.token.type === "password";
+  els.token.type = hidden ? "text" : "password";
+  els.toggle.textContent = hidden ? "Hide" : "Show";
 };
 
+els.form.onsubmit = handleConnectionConnect;
 els.refreshLocations.onclick = refreshLocations;
 els.changeLocation.onclick = refreshLocations;
 els.disconnect.onclick = disconnectConnection;
+els.refreshInventory.onclick = () => refreshCustomValuesInventory();
 
-els.scan.onclick = els.rescan.onclick = scan;
-els.search.oninput = () => {
-  state.search = els.search.value;
-  table();
-};
-els.filter.onchange = () => {
-  state.filter = els.filter.value;
-  table();
-};
-els.selectFiltered.onclick = () => {
-  items().forEach((item) => setFor(state.active).add(item.id));
-  table();
-  metrics();
-};
-els.clearCategory.onclick = () => {
-  setFor(state.active).clear();
-  table();
-  metrics();
-};
-els.clearAll.onclick = () => {
-  state.selected.clear();
-  table();
-  metrics();
-};
-els.modalClose.onclick = () => els.modal.classList.add("hidden");
-els.modal.onclick = (event) => {
-  if (event.target === els.modal) {
-    els.modal.classList.add("hidden");
-  }
-};
-els.deleteCategory.onclick = showCategory;
-els.deleteSelected.onclick = showSelected;
-els.deleteAll.onclick = showAll;
+if (els.mobileNavToggle && els.sidebar) {
+  els.mobileNavToggle.onclick = () => {
+    const open = els.sidebar.classList.toggle("open");
+    els.mobileNavToggle.setAttribute("aria-expanded", String(open));
+  };
+  els.sidebar.querySelectorAll("a").forEach((link) => {
+    link.onclick = () => {
+      els.sidebar.querySelectorAll("a").forEach((item) => item.classList.remove("active"));
+      link.classList.add("active");
+      els.sidebar.classList.remove("open");
+      els.mobileNavToggle.setAttribute("aria-expanded", "false");
+    };
+  });
+}
 
+loadConnection().catch(() => {});
 initCustomValuesSection();
-syncConnectionUI();
-loadConnection();
